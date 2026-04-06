@@ -8,6 +8,32 @@ from app.core.config import settings
 
 logger = structlog.get_logger(__name__)
 
+# Known vector dimensions keyed by model name (lowercase).
+# For unlisted models the service probes a live embedding at startup.
+_KNOWN_DIMENSIONS: dict[str, int] = {
+    # BAAI/BGE family
+    "baai/bge-small-en-v1.5": 384,
+    "baai/bge-base-en-v1.5": 768,
+    "baai/bge-large-en-v1.5": 1024,
+    "baai/bge-m3": 1024,
+    # sentence-transformers
+    "sentence-transformers/all-minilm-l6-v2": 384,
+    "sentence-transformers/all-minilm-l12-v2": 384,
+    "sentence-transformers/all-mpnet-base-v2": 768,
+    "sentence-transformers/paraphrase-multilingual-mpnet-base-v2": 768,
+    # intfloat/E5 family
+    "intfloat/e5-small-v2": 384,
+    "intfloat/e5-base-v2": 768,
+    "intfloat/e5-large-v2": 1024,
+    "intfloat/multilingual-e5-small": 384,
+    "intfloat/multilingual-e5-base": 768,
+    "intfloat/multilingual-e5-large": 1024,
+    # OpenAI
+    "text-embedding-ada-002": 1536,
+    "text-embedding-3-small": 1536,
+    "text-embedding-3-large": 3072,
+}
+
 
 class EmbeddingService:
     """Lazy-loaded embedding models for LangChain and LlamaIndex."""
@@ -64,6 +90,24 @@ class EmbeddingService:
             case _:
                 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
                 return HuggingFaceEmbedding(model_name=settings.EMBEDDING_MODEL)
+
+    def get_vector_size(self) -> int:
+        """Return the embedding dimension for the configured model.
+
+        Checks the known-dimensions table first; falls back to a live probe
+        so unknown or future models are handled automatically.
+        """
+        model_key = settings.EMBEDDING_MODEL.lower()
+        if model_key in _KNOWN_DIMENSIONS:
+            dim = _KNOWN_DIMENSIONS[model_key]
+            logger.info("embedding_dimension_from_lookup", model=settings.EMBEDDING_MODEL, dimension=dim)
+            return dim
+
+        # Live probe: embed a single token and measure the output length.
+        sample = self.model.embed_query("probe")
+        dim = len(sample)
+        logger.info("embedding_dimension_from_probe", model=settings.EMBEDDING_MODEL, dimension=dim)
+        return dim
 
     async def warmup(self) -> None:
         """Pre-load the embedding model to avoid first-request latency."""
