@@ -37,6 +37,31 @@ async def get_main_graph():
     return _graph
 
 
+async def _run_agents(state: GraphState, agent_subgraph) -> dict:
+    """Invoke the agent subgraph for each rewritten sub-question.
+
+    LangGraph cannot automatically map GraphState.rewritten_questions →
+    AgentState.question because the field names differ.  This wrapper does
+    the mapping explicitly so the orchestrator always receives a non-empty
+    question string.
+    """
+    questions = state.get("rewritten_questions") or [state.get("original_query", "")]
+    all_answers: list[str] = []
+
+    for question in questions:
+        logger.info("agent_subgraph_invoked", question=question)
+        result = await agent_subgraph.ainvoke({
+            "messages": [],
+            "question": question,
+            "self_correction_count": 0,
+        })
+        answer = result.get("answer", "")
+        if answer:
+            all_answers.append(answer)
+
+    return {"agent_answers": all_answers}
+
+
 async def _build_graph():
     """Construct and compile the full RAG pipeline graph."""
     logger.info("building_main_graph")
@@ -58,7 +83,7 @@ async def _build_graph():
     builder.add_node("summarize_history", partial(summarize_history, llm=llm))
     builder.add_node("rewrite_query", partial(rewrite_query, llm=llm))
     builder.add_node("request_clarification", request_clarification)
-    builder.add_node("agent", agent_subgraph)
+    builder.add_node("agent", partial(_run_agents, agent_subgraph=agent_subgraph))
     builder.add_node("aggregate_answers", partial(aggregate_answers, llm=llm))
     builder.add_node("save_user_memory", save_user_memory)
 

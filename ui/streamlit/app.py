@@ -174,7 +174,7 @@ def _chat_page() -> None:
                             "message": prompt,
                             "session_id": st.session_state.session_id,
                         },
-                        timeout=60.0,
+                        timeout=600.0,
                     )
                     latency = int((time.time() - start) * 1000)
 
