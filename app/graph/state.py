@@ -55,3 +55,4 @@ class AgentState(TypedDict, total=False):
     context_summary: str               # compressed context from prior tool calls
     answer: str                        # this agent's final answer
     self_correction_count: int
+    user_id: str                       # propagated from GraphState for tool collection routing

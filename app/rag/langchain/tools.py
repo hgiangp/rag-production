@@ -6,35 +6,31 @@ Tools exposed to the agent:
 """
 
 import time
-from typing import List
+from typing import Annotated, List
 
 import structlog
 from langchain_core.tools import tool
 from langchain_qdrant import QdrantVectorStore
+from langgraph.prebuilt import InjectedState
 
 from app.core.config import settings
 from app.core.metrics import RETRIEVAL_LATENCY, RETRIEVAL_RESULTS
+from app.graph.state import AgentState
 from app.services.embedding import embedding_service
 from app.services.vector_store import vector_store_service
 
 logger = structlog.get_logger(__name__)
 
 
-def _get_child_store(collection: str) -> QdrantVectorStore:
-    child_collection = f"{collection}__{settings.QDRANT_CHILD_COLLECTION}"
-    return QdrantVectorStore.from_existing_collection(
-        embedding=embedding_service.model,
-        url=f"http://{settings.QDRANT_HOST}:{settings.QDRANT_PORT}",
-        collection_name=child_collection,
-        prefer_grpc=settings.QDRANT_PREFER_GRPC,
-    )
-
-
-def get_langchain_tools(collection: str = "default") -> List:
-    """Build and return all LangChain RAG tools bound to a collection."""
+def get_langchain_tools() -> List:
+    """Build and return all LangChain RAG tools. Collection is resolved per-request from agent state."""
 
     @tool("search_child_chunks")
-    async def search_child_chunks(query: str, limit: int = settings.MAX_RETRIEVAL_K) -> str:
+    async def search_child_chunks(
+        query: str,
+        state: Annotated[AgentState, InjectedState],
+        limit: int = settings.MAX_RETRIEVAL_K,
+    ) -> str:
         """Search for relevant document passages. Use this FIRST for any factual question.
 
         Args:
@@ -44,9 +40,16 @@ def get_langchain_tools(collection: str = "default") -> List:
         Returns:
             Formatted string with matched passages and their parent IDs
         """
+        collection = f"docs_{state['user_id']}"
+        child_collection = f"{collection}__{settings.QDRANT_CHILD_COLLECTION}"
         start = time.perf_counter()
         try:
-            store = _get_child_store(collection)
+            store = QdrantVectorStore.from_existing_collection(
+                embedding=embedding_service.model,
+                url=f"http://{settings.QDRANT_HOST}:{settings.QDRANT_PORT}",
+                collection_name=child_collection,
+                prefer_grpc=settings.QDRANT_PREFER_GRPC,
+            )
             results = await store.asimilarity_search_with_relevance_scores(
                 query=query, k=limit, score_threshold=settings.RETRIEVAL_SCORE_THRESHOLD
             )
@@ -72,7 +75,10 @@ def get_langchain_tools(collection: str = "default") -> List:
             return f"RETRIEVAL_ERROR: {str(exc)}"
 
     @tool("fetch_parent_chunks")
-    async def fetch_parent_chunks(parent_ids: List[str]) -> str:
+    async def fetch_parent_chunks(
+        parent_ids: List[str],
+        state: Annotated[AgentState, InjectedState],
+    ) -> str:
         """Retrieve full context for document sections by their parent IDs.
 
         Call this AFTER search_child_chunks to get the complete context for matched passages.
@@ -83,10 +89,11 @@ def get_langchain_tools(collection: str = "default") -> List:
         Returns:
             Full content of each parent chunk
         """
+        collection = f"docs_{state['user_id']}"
+        parent_collection = f"{collection}__{settings.QDRANT_PARENT_COLLECTION}"
         start = time.perf_counter()
         try:
             client = vector_store_service.client
-            parent_collection = f"{collection}__{settings.QDRANT_PARENT_COLLECTION}"
 
             results = []
             for pid in parent_ids[:10]:  # cap at 10 to avoid token explosion

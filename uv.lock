@@ -1907,6 +1907,20 @@ wheels = [
 ]
 
 [[package]]
+name = "llama-index-embeddings-ollama"
+version = "0.9.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "llama-index-core" },
+    { name = "ollama" },
+    { name = "pytest-asyncio" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/8b/cd/2cff1feac66368a4c60ea7afbdbb3f3fdd49ee8c279fc105457e726a3ad2/llama_index_embeddings_ollama-0.9.0.tar.gz", hash = "sha256:19d2d2a0e3f0934480eae31243ac5f1ce171319578b9c0adad25cf1b6c35659e", size = 6575, upload-time = "2026-03-12T20:21:18.81Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9a/36/53674403380483510a7f657c5d6f0bdac5b7f9ec5a1a8d06cdfdd6dc47f2/llama_index_embeddings_ollama-0.9.0-py3-none-any.whl", hash = "sha256:92e0ce481e60a9bcbddbe2c369d2f72c6fdd7158d03a34ab9b35d80869b673c3", size = 6250, upload-time = "2026-03-12T20:21:19.441Z" },
+]
+
+[[package]]
 name = "llama-index-embeddings-openai"
 version = "0.6.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3770,6 +3784,7 @@ dependencies = [
     { name = "langgraph-checkpoint-postgres" },
     { name = "llama-index" },
     { name = "llama-index-embeddings-huggingface" },
+    { name = "llama-index-embeddings-ollama" },
     { name = "llama-index-embeddings-openai" },
     { name = "llama-index-llms-anthropic" },
     { name = "llama-index-llms-ollama" },
@@ -3855,6 +3870,7 @@ requires-dist = [
     { name = "langgraph-checkpoint-postgres", specifier = ">=3.0.0" },
     { name = "llama-index", specifier = ">=0.12.0" },
     { name = "llama-index-embeddings-huggingface", specifier = ">=0.4.0" },
+    { name = "llama-index-embeddings-ollama", specifier = ">=0.4.0" },
     { name = "llama-index-embeddings-openai", specifier = ">=0.3.0" },
     { name = "llama-index-llms-anthropic", specifier = ">=0.3.0" },
     { name = "llama-index-llms-ollama", specifier = ">=0.4.0" },

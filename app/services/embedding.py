@@ -87,6 +87,12 @@ class EmbeddingService:
             case "openai":
                 from llama_index.embeddings.openai import OpenAIEmbedding
                 return OpenAIEmbedding(model=settings.EMBEDDING_MODEL, api_key=settings.OPENAI_API_KEY)
+            case "ollama":
+                from llama_index.embeddings.ollama import OllamaEmbedding
+                return OllamaEmbedding(
+                    model_name=settings.EMBEDDING_MODEL,
+                    base_url=settings.OLLAMA_BASE_URL,
+                )
             case _:
                 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
                 return HuggingFaceEmbedding(model_name=settings.EMBEDDING_MODEL)

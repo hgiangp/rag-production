@@ -6,14 +6,16 @@ Contract (CLAUDE.md Rule R5):
 """
 
 import time
-from typing import List, Literal
+from typing import Annotated, List, Literal
 
 import structlog
 from langchain_core.tools import tool
+from langgraph.prebuilt import InjectedState
 from qdrant_client import QdrantClient
 
 from app.core.config import settings
 from app.core.metrics import RETRIEVAL_LATENCY, RETRIEVAL_RESULTS
+from app.graph.state import AgentState
 from app.rag.llamaindex.query_engine import LlamaQueryEngine
 
 logger = structlog.get_logger(__name__)
@@ -45,12 +47,13 @@ async def _get_engine(collection: str, mode: str) -> LlamaQueryEngine:
     return _engines[key]
 
 
-def get_llamaindex_tools(collection: str = "default") -> List:
-    """Build and return all LlamaIndex RAG tools."""
+def get_llamaindex_tools() -> List:
+    """Build and return all LlamaIndex RAG tools. Collection is resolved per-request from agent state."""
 
     @tool("llamaindex_query")
     async def llamaindex_query(
         query: str,
+        state: Annotated[AgentState, InjectedState],
         mode: Literal["sentence_window", "auto_merging"] = "sentence_window",
     ) -> str:
         """Advanced RAG query using LlamaIndex with sentence-window or auto-merging retrieval.
@@ -65,6 +68,7 @@ def get_llamaindex_tools(collection: str = "default") -> List:
         Returns:
             Retrieved and reranked context with source references
         """
+        collection = f"docs_{state['user_id']}"
         start = time.perf_counter()
         try:
             engine = await _get_engine(collection, mode)
