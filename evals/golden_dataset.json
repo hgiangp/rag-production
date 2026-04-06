@@ -1,0 +1,26 @@
+[
+  {
+    "id": "eval_001",
+    "query": "What is RAG and how does it work?",
+    "expected_keywords": ["retrieval", "augmented", "generation", "vector", "context"],
+    "min_context_relevance": 0.7,
+    "min_groundedness": 0.7,
+    "min_answer_relevance": 0.8
+  },
+  {
+    "id": "eval_002",
+    "query": "What are the main components of the system?",
+    "expected_keywords": ["api", "langgraph", "qdrant", "evaluation"],
+    "min_context_relevance": 0.6,
+    "min_groundedness": 0.6,
+    "min_answer_relevance": 0.7
+  },
+  {
+    "id": "eval_003",
+    "query": "How is the RAG triad calculated?",
+    "expected_keywords": ["context relevance", "groundedness", "answer relevance", "llm"],
+    "min_context_relevance": 0.7,
+    "min_groundedness": 0.7,
+    "min_answer_relevance": 0.75
+  }
+]
