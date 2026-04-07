@@ -8,7 +8,7 @@ from uuid import UUID
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 from app.core.auth import CurrentUser, get_current_user
 from app.core.config import settings
@@ -62,7 +62,19 @@ async def chat_invoke(
         logger.exception("graph_invocation_failed", error=str(exc))
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Pipeline failed")
 
-    final_answer = result.get("final_answer", "I could not generate a response.")
+    final_answer = result.get("final_answer", "")
+
+    # Graph interrupted before request_clarification — return the clarification question
+    if not final_answer and not result.get("question_is_clear", True):
+        messages = result.get("messages", [])
+        for msg in reversed(messages):
+            if isinstance(msg, AIMessage) and msg.content:
+                final_answer = msg.content
+                break
+
+    if not final_answer:
+        final_answer = "I could not generate a response."
+
     citations = [Citation(**c) for c in result.get("source_citations", [])]
     contexts = result.get("retrieved_contexts", [])
     latency_ms = int(time.time() * 1000) - start_ms
@@ -130,12 +142,27 @@ async def chat_stream(
         }
 
         try:
+            token_emitted = False
             async for event in graph.astream_events(initial_state, config=config, version="v2"):
                 if event["event"] == "on_chat_model_stream":
                     chunk = event["data"]["chunk"]
                     if hasattr(chunk, "content") and chunk.content:
                         sse = StreamChunk(type="token", content=chunk.content)
                         yield f"data: {sse.model_dump_json()}\n\n"
+                        token_emitted = True
+
+            # If no tokens were streamed the graph interrupted for clarification —
+            # emit the clarification message as a single token event.
+            if not token_emitted:
+                snapshot = await graph.aget_state(config)
+                state_values = snapshot.values if snapshot else {}
+                if not state_values.get("question_is_clear", True):
+                    messages = state_values.get("messages", [])
+                    for msg in reversed(messages):
+                        if isinstance(msg, AIMessage) and msg.content:
+                            sse = StreamChunk(type="token", content=msg.content)
+                            yield f"data: {sse.model_dump_json()}\n\n"
+                            break
 
             # Final done event
             done = StreamChunk(type="done")
