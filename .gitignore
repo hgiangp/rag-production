@@ -54,3 +54,6 @@ prometheus/data/
 htmlcov/
 .mypy_cache/
 .ruff_cache/
+
+# export data
+exports  

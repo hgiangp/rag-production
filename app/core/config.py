@@ -143,11 +143,12 @@ class Settings:
         self.ALLOWED_FILE_TYPES: List[str] = _list("ALLOWED_FILE_TYPES", ["pdf", "docx", "txt", "md"])
 
         # ── LlamaIndex ───────────────────────────────────────────────────────
-        self.LLAMAINDEX_SENTENCE_WINDOW_SIZE: int = _int("LLAMAINDEX_SENTENCE_WINDOW_SIZE", 3)
         self.LLAMAINDEX_SIMILARITY_TOP_K: int = _int("LLAMAINDEX_SIMILARITY_TOP_K", 5)
         self.LLAMAINDEX_AUTO_MERGE_CHUNK_SIZES: List[int] = [
             int(x) for x in _list("LLAMAINDEX_AUTO_MERGE_CHUNK_SIZES", ["2048", "512", "128"])
         ]
+        self.LLAMAINDEX_AUTO_MERGE_RATIO_THRESH: float = _float("LLAMAINDEX_AUTO_MERGE_RATIO_THRESH", 0.5)
+        self.LLAMAINDEX_DOCSTORE_PATH: str = os.getenv("LLAMAINDEX_DOCSTORE_PATH", "data/docstore")
 
         # ── Reranking ────────────────────────────────────────────────────────
         self.COHERE_API_KEY: str = os.getenv("COHERE_API_KEY", "")
