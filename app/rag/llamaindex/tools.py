@@ -29,7 +29,7 @@ from qdrant_client import QdrantClient
 from app.core.config import settings
 from app.core.metrics import RETRIEVAL_LATENCY, RETRIEVAL_RESULTS
 from app.graph.state import AgentState
-from app.rag.llamaindex.indexer import _docstore_path, _leaf_collection
+from app.rag.llamaindex.indexer import _collection_name, _docstore_path
 from app.rag.llamaindex.query_engine import LlamaQueryEngine
 
 logger = structlog.get_logger(__name__)
@@ -65,7 +65,7 @@ async def _get_engine(collection: str, mode: Literal["auto_merging", "recursive"
     )
     vector_store = QdrantVectorStore(
         client=sync_client,
-        collection_name=_leaf_collection(collection),
+        collection_name=_collection_name(collection),
     )
     storage_ctx = StorageContext.from_defaults(vector_store=vector_store, docstore=docstore)
     index = VectorStoreIndex.from_vector_store(vector_store, storage_context=storage_ctx)

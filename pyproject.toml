@@ -36,6 +36,8 @@ dependencies = [
     "llama-index-llms-ollama>=0.4.0",
     "llama-index-embeddings-ollama>=0.4.0",
     "llama-index-postprocessor-cohere-rerank>=0.3.0",
+    "llama-index-readers-docling>=0.3.0",
+    "llama-index-node-parser-docling>=0.3.0",
     # --- Database ---
     "sqlmodel>=0.0.24",
     "psycopg[binary]>=3.3.0",

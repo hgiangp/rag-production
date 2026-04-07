@@ -1,35 +1,26 @@
-"""LlamaIndex hierarchical indexer: Docling layout → heading-based node hierarchy.
+"""LlamaIndex indexer using DoclingReader for document parsing.
 
-Indexing strategy (Strategy B — heading-aware):
-  1. Docling HybridChunker → leaf chunks that respect semantic boundaries
-     (paragraph / table / list — never cuts mid-sentence or mid-table)
-  2. Heading metadata (H1 > H2 > H3) from each chunk defines the parent hierarchy
-  3. Parent nodes  = full section text (all leaf texts under that heading concatenated)
-     → real document sections, not arbitrary token windows
-  4. PARENT / CHILD NodeRelationship links set explicitly on every node
-  5. Leaf nodes  → Qdrant (ANN search)
-     All nodes   → SimpleDocumentStore (persisted per-collection for auto-merging)
+Supports two parser modes (configurable via LLAMAINDEX_PARSER_MODE):
+  - "markdown": DoclingReader (Markdown export) + MarkdownNodeParser
+    → Simpler, good for general use
+  - "docling": DoclingReader (JSON export) + DoclingNodeParser
+    → Richer grounding info (page numbers, bounding boxes)
 
-Fallback (flat/no-heading documents):
-  HierarchicalNodeParser with token sizes from settings — same behaviour as before,
-  but only triggered when Docling finds no heading structure.
+Both modes index nodes into Qdrant for vector search.
 """
 
 import asyncio
-from collections import defaultdict
+import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List
 
 import structlog
-from llama_index.core import Document, Settings as LISettings, StorageContext, VectorStoreIndex
-from llama_index.core.node_parser import HierarchicalNodeParser, get_leaf_nodes
-from llama_index.core.schema import (
-    BaseNode,
-    NodeRelationship,
-    RelatedNodeInfo,
-    TextNode,
-)
+from llama_index.core import Settings as LISettings, StorageContext, VectorStoreIndex
+from llama_index.core.node_parser import MarkdownNodeParser
+from llama_index.core.schema import BaseNode
 from llama_index.core.storage.docstore import SimpleDocumentStore
+from llama_index.node_parser.docling import DoclingNodeParser
+from llama_index.readers.docling import DoclingReader
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from qdrant_client import AsyncQdrantClient
 
@@ -40,7 +31,7 @@ logger = structlog.get_logger(__name__)
 
 
 class LlamaIndexer:
-    """Hierarchical document indexer: Docling layout + heading-based parent hierarchy.
+    """Document indexer using LlamaIndex DoclingReader.
 
     Call index_document() from the ingest endpoint.
     Call delete_document() from the delete endpoint.
@@ -52,8 +43,6 @@ class LlamaIndexer:
             port=settings.QDRANT_PORT,
             api_key=settings.QDRANT_API_KEY or None,
         )
-
-    # ── public API ──────────────────────────────────────────────────────────
 
     async def index_document(
         self,
@@ -70,41 +59,45 @@ class LlamaIndexer:
 
         loop = asyncio.get_event_loop()
 
-        # Steps 1-3 are CPU-bound → run in thread pool so we don't block the event loop
-        leaf_nodes, parent_nodes = await loop.run_in_executor(
+        # Parse and chunk in thread pool (CPU-bound)
+        nodes = await loop.run_in_executor(
             None,
             _build_nodes,
-            content, file_type, filename, document_id,
+            content,
+            file_type,
+            filename,
+            document_id,
         )
 
-        all_nodes = leaf_nodes + parent_nodes
+        if not nodes:
+            logger.warning("no_nodes_created", filename=filename, document_id=document_id)
+            return 0
 
-        # Load or create the per-collection docstore (file I/O → thread pool)
+        # Load or create the per-collection docstore
         docstore_path = _docstore_path(collection)
         docstore = await loop.run_in_executor(None, _load_docstore, docstore_path)
-        docstore.add_documents(all_nodes)
+        docstore.add_documents(nodes)
 
-        # Index leaf nodes into Qdrant using the async client
+        # Index nodes into Qdrant
         vector_store = QdrantVectorStore(
             aclient=self._aclient,
-            collection_name=_leaf_collection(collection),
+            collection_name=_collection_name(collection),
         )
         storage_ctx = StorageContext.from_defaults(vector_store=vector_store, docstore=docstore)
         index = VectorStoreIndex([], storage_context=storage_ctx, show_progress=False)
-        await index.ainsert_nodes(leaf_nodes)
+        await index.ainsert_nodes(nodes)
 
-        # Persist docstore with the new nodes (file I/O → thread pool)
+        # Persist docstore
         await loop.run_in_executor(None, docstore.persist, str(docstore_path))
 
-        total = len(all_nodes)
+        total = len(nodes)
         INGEST_CHUNKS.observe(total)
         logger.info(
             "document_indexed",
             document_id=document_id,
             filename=filename,
             total_nodes=total,
-            leaf_nodes=len(leaf_nodes),
-            parent_nodes=len(parent_nodes),
+            parser_mode=settings.LLAMAINDEX_PARSER_MODE,
         )
         return total
 
@@ -113,7 +106,7 @@ class LlamaIndexer:
         from qdrant_client.models import FieldCondition, Filter, MatchValue
 
         await self._aclient.delete(
-            collection_name=_leaf_collection(collection),
+            collection_name=_collection_name(collection),
             points_selector=Filter(
                 must=[FieldCondition(key="document_id", match=MatchValue(value=document_id))]
             ),
@@ -126,10 +119,8 @@ class LlamaIndexer:
         logger.info("document_deleted", document_id=document_id, collection=collection)
 
 
-# ── module-level helpers (all sync — called from thread pool) ───────────────
-
-def _leaf_collection(collection: str) -> str:
-    return f"{collection}__llama_leaves"
+def _collection_name(collection: str) -> str:
+    return f"{collection}__llama"
 
 
 def _docstore_path(collection: str) -> Path:
@@ -142,195 +133,69 @@ def _build_nodes(
     file_type: str,
     filename: str,
     document_id: str,
-) -> Tuple[List[TextNode], List[TextNode]]:
-    """Parse document and build the node hierarchy. Returns (leaf_nodes, parent_nodes)."""
-    # Try Docling-native heading hierarchy first
-    try:
-        leaf_nodes, parent_nodes = _build_from_docling(content, file_type, filename, document_id)
-        if leaf_nodes:
-            return leaf_nodes, parent_nodes
-        logger.info("docling_no_leaves_fallback", filename=filename)
-    except Exception as exc:
-        logger.warning("docling_build_failed_fallback", error=str(exc), filename=filename)
-
-    # Fallback: token-based HierarchicalNodeParser
-    return _build_from_token_splitter(content, file_type, filename, document_id)
-
-
-def _build_from_docling(
-    content: bytes,
-    file_type: str,
-    filename: str,
-    document_id: str,
-) -> Tuple[List[TextNode], List[TextNode]]:
-    """Use Docling HybridChunker → heading-based hierarchy.
-
-    Returns (leaf_nodes, parent_nodes) with PARENT/CHILD relationships wired.
-    parent_nodes contains one TextNode per unique heading path, whose text is
-    the concatenation of all leaf texts under that section — exactly what
-    AutoMergingRetriever returns when it merges siblings.
-    """
+) -> List[BaseNode]:
+    """Parse document using DoclingReader and configured node parser."""
     import os
-    import tempfile
-    from docling.document_converter import DocumentConverter
-    from docling.chunking import HybridChunker
 
-    # Write bytes to a temp file (Docling requires a file path)
+    # Write content to temp file (DoclingReader requires file path)
     suffix = f".{file_type}"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(content)
         tmp_path = tmp.name
 
     try:
-        converter = DocumentConverter()
-        result = converter.convert(tmp_path)
-        docling_doc = result.document
+        nodes = _parse_with_docling(tmp_path, document_id, filename)
     finally:
         os.unlink(tmp_path)
 
-    # Leaf chunk size = smallest level in the merge hierarchy
-    leaf_max_tokens = settings.LLAMAINDEX_AUTO_MERGE_CHUNK_SIZES[-1]
-    chunker = HybridChunker(
-        tokenizer=settings.EMBEDDING_MODEL,
-        max_tokens=leaf_max_tokens,
-        merge_peers=True,
-    )
-    chunks = list(chunker.chunk(docling_doc))
-
-    return _chunks_to_nodes(chunks, document_id, filename)
+    return nodes
 
 
-def _chunks_to_nodes(
-    chunks: list,
+def _parse_with_docling(
+    file_path: str,
     document_id: str,
     filename: str,
-) -> Tuple[List[TextNode], List[TextNode]]:
-    """Convert Docling chunks → LlamaIndex TextNodes with heading-based hierarchy.
+) -> List[BaseNode]:
+    """Use DoclingReader with configured parser mode."""
+    mode = settings.LLAMAINDEX_PARSER_MODE.lower()
 
-    Node structure:
-      Leaf: one TextNode per chunk, PARENT → immediate heading section
-      Parent: one TextNode per unique heading path, CHILD → [leaves + sub-sections]
-               text = concatenation of all descendant leaf texts
-    """
-    # ── Step 1: collect leaf texts per heading path ──────────────────────────
-    # heading_texts[path] = list of leaf texts under that path (and all ancestors)
-    heading_texts: Dict[Tuple[str, ...], List[str]] = defaultdict(list)
-    leaf_entries: List[Tuple[TextNode, Tuple[str, ...]]] = []
+    if mode == "docling":
+        # JSON export + DoclingNodeParser (richer grounding)
+        reader = DoclingReader(export_type=DoclingReader.ExportType.JSON)
+        node_parser = DoclingNodeParser()
+        logger.debug("using_docling_parser", mode="docling")
+    else:
+        # Markdown export + MarkdownNodeParser (simpler, default)
+        reader = DoclingReader(export_type=DoclingReader.ExportType.MARKDOWN)
+        node_parser = MarkdownNodeParser()
+        logger.debug("using_markdown_parser", mode="markdown")
 
-    for chunk in chunks:
-        raw_headings = getattr(chunk.meta, "headings", None)
-        headings: Tuple[str, ...] = tuple(raw_headings) if raw_headings else ()
-        text = chunk.text.strip() if hasattr(chunk, "text") else str(chunk).strip()
-        if not text:
-            continue
+    # Load documents
+    documents = reader.load_data(file_path)
 
-        # Accumulate this text at every ancestor heading path
-        for level in range(len(headings)):
-            heading_texts[headings[: level + 1]].append(text)
+    # Add metadata to documents before parsing
+    for doc in documents:
+        doc.metadata["document_id"] = document_id
+        doc.metadata["filename"] = filename
 
-        leaf = TextNode(
-            text=text,
-            metadata={
-                "document_id": document_id,
-                "filename": filename,
-                "node_type": "leaf",
-                "heading_path": " > ".join(headings),
-            },
-        )
-        leaf_entries.append((leaf, headings))
+    # Parse into nodes
+    nodes = node_parser.get_nodes_from_documents(documents)
 
-    # ── Step 2: create one parent node per unique heading path ───────────────
-    heading_to_node: Dict[Tuple[str, ...], TextNode] = {}
-    for path, texts in heading_texts.items():
-        heading_to_node[path] = TextNode(
-            text="\n\n".join(texts),
-            metadata={
-                "document_id": document_id,
-                "filename": filename,
-                "node_type": "section",
-                "heading": path[-1],
-                "heading_level": len(path),
-                "heading_path": " > ".join(path),
-            },
-        )
+    # Ensure all nodes have the document metadata
+    for node in nodes:
+        node.metadata["document_id"] = document_id
+        node.metadata["filename"] = filename
 
-    # ── Step 3: wire PARENT on section nodes (nested sections) ───────────────
-    for path, node in heading_to_node.items():
-        if len(path) > 1:
-            grandparent = heading_to_node.get(path[:-1])
-            if grandparent:
-                node.relationships[NodeRelationship.PARENT] = RelatedNodeInfo(
-                    node_id=grandparent.node_id
-                )
-
-    # ── Step 4: collect CHILD lists and wire PARENT on leaf nodes ────────────
-    children_per_parent: Dict[str, List[RelatedNodeInfo]] = defaultdict(list)
-
-    # Sub-section children (section → sub-section)
-    for path, node in heading_to_node.items():
-        if len(path) > 1:
-            grandparent = heading_to_node.get(path[:-1])
-            if grandparent:
-                children_per_parent[grandparent.node_id].append(
-                    RelatedNodeInfo(node_id=node.node_id)
-                )
-
-    # Leaf children (section → leaf)
-    all_leaf_nodes: List[TextNode] = []
-    for leaf, headings in leaf_entries:
-        if headings:
-            parent = heading_to_node.get(headings)
-            if parent:
-                leaf.relationships[NodeRelationship.PARENT] = RelatedNodeInfo(
-                    node_id=parent.node_id
-                )
-                children_per_parent[parent.node_id].append(
-                    RelatedNodeInfo(node_id=leaf.node_id)
-                )
-        all_leaf_nodes.append(leaf)
-
-    # Assign CHILD to every parent so AutoMergingRetriever can count siblings
-    for path, node in heading_to_node.items():
-        kids = children_per_parent.get(node.node_id)
-        if kids:
-            node.relationships[NodeRelationship.CHILD] = kids
-
-    return all_leaf_nodes, list(heading_to_node.values())
-
-
-def _build_from_token_splitter(
-    content: bytes,
-    file_type: str,
-    filename: str,
-    document_id: str,
-) -> Tuple[List[TextNode], List[TextNode]]:
-    """Fallback: token-based HierarchicalNodeParser for flat/no-heading documents."""
-    text = _extract_text_basic(content, file_type)
-    li_doc = Document(
-        text=text,
-        metadata={"document_id": document_id, "filename": filename},
+    logger.info(
+        "document_parsed",
+        filename=filename,
+        document_id=document_id,
+        num_documents=len(documents),
+        num_nodes=len(nodes),
+        parser_mode=mode,
     )
-    node_parser = HierarchicalNodeParser.from_defaults(
-        chunk_sizes=settings.LLAMAINDEX_AUTO_MERGE_CHUNK_SIZES
-    )
-    all_nodes = node_parser.get_nodes_from_documents([li_doc])
-    leaf_nodes = get_leaf_nodes(all_nodes)
-    parent_nodes = [n for n in all_nodes if n not in set(leaf_nodes)]
-    return leaf_nodes, parent_nodes
 
-
-def _extract_text_basic(content: bytes, file_type: str) -> str:
-    """Minimal text extraction without Docling (txt / md, or final fallback)."""
-    import io
-    if file_type == "pdf":
-        from pypdf import PdfReader
-        reader = PdfReader(io.BytesIO(content))
-        return "\n\n".join(page.extract_text() or "" for page in reader.pages)
-    if file_type == "docx":
-        from docx import Document as DocxDocument
-        doc = DocxDocument(io.BytesIO(content))
-        return "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
-    return content.decode("utf-8", errors="replace")
+    return nodes
 
 
 def _load_docstore(path: Path) -> SimpleDocumentStore:

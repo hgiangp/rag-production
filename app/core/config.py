@@ -149,6 +149,8 @@ class Settings:
         ]
         self.LLAMAINDEX_AUTO_MERGE_RATIO_THRESH: float = _float("LLAMAINDEX_AUTO_MERGE_RATIO_THRESH", 0.5)
         self.LLAMAINDEX_DOCSTORE_PATH: str = os.getenv("LLAMAINDEX_DOCSTORE_PATH", "data/docstore")
+        # Parser mode: "markdown" (simpler, MarkdownNodeParser) or "docling" (richer, DoclingNodeParser with JSON)
+        self.LLAMAINDEX_PARSER_MODE: str = os.getenv("LLAMAINDEX_PARSER_MODE", "markdown")
 
         # ── Reranking ────────────────────────────────────────────────────────
         self.COHERE_API_KEY: str = os.getenv("COHERE_API_KEY", "")
