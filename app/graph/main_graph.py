@@ -17,7 +17,6 @@ from app.graph.nodes.generation import aggregate_answers
 from app.graph.nodes.memory import load_user_memory, save_user_memory
 from app.graph.nodes.query import request_clarification, rewrite_query, summarize_history
 from app.graph.state import GraphState
-from app.rag.langchain.tools import get_langchain_tools
 from app.rag.llamaindex.tools import get_llamaindex_tools
 from app.services.llm import get_llm
 
@@ -69,10 +68,8 @@ async def _build_graph():
 
     llm = get_llm(model=settings.DEFAULT_LLM_MODEL)
 
-    # Collect all RAG tools
-    lc_tools = get_langchain_tools()
-    li_tools = get_llamaindex_tools()
-    all_tools = lc_tools + li_tools
+    # All RAG retrieval goes through LlamaIndex (heading-aware hierarchy + auto-merging)
+    all_tools = get_llamaindex_tools()
 
     # Build agent subgraph
     agent_subgraph = create_agent_subgraph(llm=llm, tools_list=all_tools)

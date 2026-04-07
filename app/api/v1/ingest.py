@@ -10,13 +10,14 @@ from app.core.auth import CurrentUser, get_current_user
 from app.core.config import settings
 from app.core.limiter import limiter
 from app.core.metrics import INGEST_COUNT, INGEST_LATENCY
-from app.rag.langchain.indexer import HierarchicalIndexer
+from app.rag.llamaindex.indexer import LlamaIndexer
+from app.rag.llamaindex.tools import invalidate_engine_cache
 from app.schemas.ingest import DeleteDocumentResponse, IngestResponse
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/documents", tags=["ingest"])
 
-_indexer = HierarchicalIndexer()
+_indexer = LlamaIndexer()
 
 
 @router.post("", response_model=IngestResponse, status_code=status.HTTP_202_ACCEPTED)
@@ -52,7 +53,7 @@ async def ingest_document(
         collection=collection,
     )
 
-    # Kick off indexing without blocking response (202 Accepted pattern)
+    # Kick off indexing without blocking response (202 Accepted pattern — R7)
     asyncio.create_task(
         _run_indexing(
             document_id=document_id,
@@ -60,7 +61,6 @@ async def ingest_document(
             content=content,
             file_type=ext,
             collection=collection,
-            user_id=str(current_user.user_id),
         )
     )
 
@@ -77,10 +77,11 @@ async def delete_document(
     document_id: UUID,
     current_user: CurrentUser = Depends(get_current_user),
 ) -> DeleteDocumentResponse:
-    """Remove a document and all its chunks from the vector store."""
+    """Remove a document and all its nodes from the vector store and docstore."""
     collection = f"docs_{current_user.user_id}"
     try:
         await _indexer.delete_document(document_id=str(document_id), collection=collection)
+        invalidate_engine_cache(collection)
         logger.info("document_deleted", document_id=str(document_id))
         return DeleteDocumentResponse(document_id=document_id, deleted=True)
     except Exception as exc:
@@ -94,12 +95,11 @@ async def _run_indexing(
     content: bytes,
     file_type: str,
     collection: str,
-    user_id: str,
 ) -> None:
     import time
     start = time.perf_counter()
     try:
-        chunk_count = await _indexer.index_document(
+        node_count = await _indexer.index_document(
             document_id=str(document_id),
             filename=filename,
             content=content,
@@ -107,9 +107,11 @@ async def _run_indexing(
             collection=collection,
         )
         duration = time.perf_counter() - start
+        # Invalidate stale engine caches so next query loads fresh nodes
+        invalidate_engine_cache(collection)
         INGEST_COUNT.labels(file_type=file_type, status="success").inc()
         INGEST_LATENCY.labels(file_type=file_type).observe(duration)
-        logger.info("ingest_completed", document_id=str(document_id), chunk_count=chunk_count)
+        logger.info("ingest_completed", document_id=str(document_id), node_count=node_count)
     except Exception as exc:
         INGEST_COUNT.labels(file_type=file_type, status="failed").inc()
         logger.exception("ingest_failed", document_id=str(document_id), error=str(exc))
