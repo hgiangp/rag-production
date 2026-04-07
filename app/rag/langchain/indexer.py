@@ -60,7 +60,7 @@ class HierarchicalIndexer:
         client = vector_store_service.client
         for suffix in [settings.QDRANT_CHILD_COLLECTION, settings.QDRANT_PARENT_COLLECTION]:
             coll = f"{collection}__{suffix}"
-            client.delete(
+            await client.delete(
                 collection_name=coll,
                 points_selector={"filter": {"must": [{"key": "document_id", "match": {"value": document_id}}]}},
             )
@@ -126,7 +126,7 @@ class HierarchicalIndexer:
             )
             for doc in docs
         ]
-        client.upsert(collection_name=collection, points=points)
+        await client.upsert(collection_name=collection, points=points)
 
     @staticmethod
     async def _extract_text(content: bytes, file_type: str, filename: str) -> str:
