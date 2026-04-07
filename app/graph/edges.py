@@ -6,6 +6,8 @@ Keep routing logic minimal — no side effects, no I/O.
 
 from typing import Literal
 
+from langchain_core.messages import ToolMessage
+
 from app.core.config import settings
 from app.graph.state import AgentState, GraphState
 
@@ -25,8 +27,12 @@ def route_after_orchestrator(
     """After orchestrator LLM call: route to tools, answer collection, or fallback."""
     last_message = state["messages"][-1]
 
-    # LLM wants to call tools
+    # LLM wants to call tools — but enforce a hard cap on total tool-call rounds
+    # to prevent infinite loops when tools keep returning errors or insufficient data.
     if getattr(last_message, "tool_calls", None):
+        tool_rounds = sum(1 for m in state.get("messages", []) if isinstance(m, ToolMessage))
+        if tool_rounds >= settings.MAX_SELF_CORRECTION_ITERATIONS * 2:
+            return "fallback_response"
         return "tools"
 
     # Self-correction limit exceeded → fallback

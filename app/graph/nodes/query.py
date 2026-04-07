@@ -86,15 +86,17 @@ async def rewrite_query(state: GraphState, llm: BaseChatModel) -> dict:
 
     GRAPH_NODE_LATENCY.labels(node="rewrite_query").observe(time.perf_counter() - start)
 
-    if analysis.is_clear and analysis.questions:
-        # Clear query: remove old messages to save tokens, keep rewritten questions
+    if analysis.is_clear:
+        # Clear query: remove old messages to save tokens, keep rewritten questions.
+        # Fall back to original query if the LLM returned an empty questions list.
+        questions = analysis.questions if analysis.questions else [last_msg.content]
         delete_all = [RemoveMessage(id=m.id) for m in state["messages"] if not isinstance(m, SystemMessage)]
-        logger.info("query_rewritten", sub_questions=len(analysis.questions))
+        logger.info("query_rewritten", sub_questions=len(questions))
         return {
             "question_is_clear": True,
             "messages": delete_all,
             "original_query": last_msg.content,
-            "rewritten_questions": analysis.questions,
+            "rewritten_questions": questions,
         }
 
     # Unclear: append clarification message

@@ -89,6 +89,8 @@ def get_langchain_tools() -> List:
         Returns:
             Full content of each parent chunk
         """
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
         collection = f"docs_{state['user_id']}"
         parent_collection = f"{collection}__{settings.QDRANT_PARENT_COLLECTION}"
         start = time.perf_counter()
@@ -97,10 +99,13 @@ def get_langchain_tools() -> List:
 
             results = []
             for pid in parent_ids[:10]:  # cap at 10 to avoid token explosion
-                hits = client.scroll(
+                hits = await client.scroll(
                     collection_name=parent_collection,
-                    scroll_filter={"must": [{"key": "parent_id", "match": {"value": pid}}]},
+                    scroll_filter=Filter(
+                        must=[FieldCondition(key="parent_id", match=MatchValue(value=pid))]
+                    ),
                     limit=1,
+                    with_payload=True,
                 )
                 if hits[0]:
                     payload = hits[0][0].payload
