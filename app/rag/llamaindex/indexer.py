@@ -7,12 +7,15 @@ Supports two parser modes (configurable via LLAMAINDEX_PARSER_MODE):
     → Richer grounding info (page numbers, bounding boxes)
 
 Both modes index nodes into Qdrant for vector search.
+
+Supports single document (index_document) and batch (index_documents) ingestion.
 """
 
 import asyncio
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 import structlog
 from llama_index.core import Settings as LISettings, StorageContext, VectorStoreIndex
@@ -28,6 +31,16 @@ from app.core.config import settings
 from app.core.metrics import INGEST_CHUNKS
 
 logger = structlog.get_logger(__name__)
+
+
+@dataclass
+class DocumentInput:
+    """Input for batch document indexing."""
+
+    document_id: str
+    filename: str
+    content: bytes
+    file_type: str
 
 
 class LlamaIndexer:
@@ -87,8 +100,8 @@ class LlamaIndexer:
         index = VectorStoreIndex([], storage_context=storage_ctx, show_progress=False)
         await index.ainsert_nodes(nodes)
 
-        # Persist docstore
-        await loop.run_in_executor(None, docstore.persist, str(docstore_path))
+        # Persist docstore (persist expects file path, not directory)
+        await loop.run_in_executor(None, docstore.persist, str(docstore_path / "docstore.json"))
 
         total = len(nodes)
         INGEST_CHUNKS.observe(total)
@@ -100,6 +113,85 @@ class LlamaIndexer:
             parser_mode=settings.LLAMAINDEX_PARSER_MODE,
         )
         return total
+
+    async def index_documents(
+        self,
+        documents: List[DocumentInput],
+        collection: str,
+    ) -> Dict[str, int]:
+        """Batch index multiple documents. Returns dict of document_id -> node count.
+
+        More efficient than calling index_document() multiple times:
+        - Parses documents in parallel
+        - Single docstore load/persist
+        - Single Qdrant batch insert
+        - No race conditions
+        """
+        if not documents:
+            return {}
+
+        from app.services.embedding import embedding_service
+
+        LISettings.embed_model = embedding_service.llamaindex_model
+
+        loop = asyncio.get_event_loop()
+
+        # Parse all documents in parallel (CPU-bound, use thread pool)
+        parse_tasks = [
+            loop.run_in_executor(
+                None,
+                _build_nodes,
+                doc.content,
+                doc.file_type,
+                doc.filename,
+                doc.document_id,
+            )
+            for doc in documents
+        ]
+        all_node_lists = await asyncio.gather(*parse_tasks)
+
+        # Collect nodes and counts per document
+        all_nodes: List[BaseNode] = []
+        node_counts: Dict[str, int] = {}
+        for doc, nodes in zip(documents, all_node_lists):
+            if nodes:
+                all_nodes.extend(nodes)
+                node_counts[doc.document_id] = len(nodes)
+            else:
+                node_counts[doc.document_id] = 0
+                logger.warning("no_nodes_created", filename=doc.filename, document_id=doc.document_id)
+
+        if not all_nodes:
+            logger.warning("batch_index_no_nodes", collection=collection, doc_count=len(documents))
+            return node_counts
+
+        # Load docstore once, add all nodes
+        docstore_path = _docstore_path(collection)
+        docstore = await loop.run_in_executor(None, _load_docstore, docstore_path)
+        docstore.add_documents(all_nodes)
+
+        # Index all nodes into Qdrant in one batch
+        vector_store = QdrantVectorStore(
+            aclient=self._aclient,
+            collection_name=_collection_name(collection),
+        )
+        storage_ctx = StorageContext.from_defaults(vector_store=vector_store, docstore=docstore)
+        index = VectorStoreIndex([], storage_context=storage_ctx, show_progress=False)
+        await index.ainsert_nodes(all_nodes)
+
+        # Persist docstore once
+        await loop.run_in_executor(None, docstore.persist, str(docstore_path / "docstore.json"))
+
+        total = len(all_nodes)
+        INGEST_CHUNKS.observe(total)
+        logger.info(
+            "batch_documents_indexed",
+            collection=collection,
+            doc_count=len(documents),
+            total_nodes=total,
+            parser_mode=settings.LLAMAINDEX_PARSER_MODE,
+        )
+        return node_counts
 
     async def delete_document(self, document_id: str, collection: str) -> None:
         """Remove all nodes for a document from Qdrant and the docstore."""
@@ -117,6 +209,42 @@ class LlamaIndexer:
             None, _prune_docstore, _docstore_path(collection), document_id
         )
         logger.info("document_deleted", document_id=document_id, collection=collection)
+
+    async def delete_documents(self, document_ids: List[str], collection: str) -> int:
+        """Batch delete multiple documents. Returns count of deleted documents.
+
+        More efficient than calling delete_document() multiple times:
+        - Single Qdrant delete with OR filter
+        - Single docstore prune operation
+        """
+        if not document_ids:
+            return 0
+
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+        # Delete from Qdrant with OR filter for all document IDs
+        await self._aclient.delete(
+            collection_name=_collection_name(collection),
+            points_selector=Filter(
+                should=[
+                    FieldCondition(key="document_id", match=MatchValue(value=doc_id))
+                    for doc_id in document_ids
+                ]
+            ),
+        )
+
+        # Prune docstore for all documents
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None, _prune_docstore_batch, _docstore_path(collection), document_ids
+        )
+
+        logger.info(
+            "batch_documents_deleted",
+            collection=collection,
+            doc_count=len(document_ids),
+        )
+        return len(document_ids)
 
 
 def _collection_name(collection: str) -> str:
@@ -217,4 +345,19 @@ def _prune_docstore(path: Path, document_id: str) -> None:
     ]
     for nid in to_delete:
         docstore.delete_document(nid)
-    docstore.persist(str(path))
+    docstore.persist(str(path / "docstore.json"))
+
+
+def _prune_docstore_batch(path: Path, document_ids: List[str]) -> None:
+    """Remove nodes belonging to multiple document_ids from the persisted docstore."""
+    if not (path / "docstore.json").exists():
+        return
+    docstore = SimpleDocumentStore.from_persist_dir(str(path))
+    doc_id_set = set(document_ids)
+    to_delete = [
+        nid for nid, node in docstore.docs.items()
+        if getattr(node, "metadata", {}).get("document_id") in doc_id_set
+    ]
+    for nid in to_delete:
+        docstore.delete_document(nid)
+    docstore.persist(str(path / "docstore.json"))

@@ -40,7 +40,7 @@ class TestLoadDocstore:
         original = SimpleDocumentStore()
         node = TextNode(text="test", metadata={"document_id": "d1"})
         original.add_documents([node])
-        original.persist(str(store_path))
+        original.persist(str(store_path / "docstore.json"))
 
         loaded = _load_docstore(store_path)
         assert node.node_id in loaded.docs
@@ -56,7 +56,7 @@ class TestPruneDocstore:
         keep = TextNode(text="keep", metadata={"document_id": "doc_A"})
         delete = TextNode(text="delete", metadata={"document_id": "doc_B"})
         store.add_documents([keep, delete])
-        store.persist(str(store_path))
+        store.persist(str(store_path / "docstore.json"))
 
         _prune_docstore(store_path, "doc_B")
 
@@ -172,7 +172,7 @@ class TestLlamaIndexer:
         store = SimpleDocumentStore()
         node = TextNode(text="to delete", metadata={"document_id": "doc3"})
         store.add_documents([node])
-        store.persist(str(store_path))
+        store.persist(str(store_path / "docstore.json"))
 
         with (
             patch("app.core.config.settings.LLAMAINDEX_DOCSTORE_PATH", str(tmp_path)),

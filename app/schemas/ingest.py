@@ -25,3 +25,18 @@ class DocumentStatus(BaseModel):
 class DeleteDocumentResponse(BaseModel):
     document_id: UUID
     deleted: bool
+
+
+class BatchIngestResponse(BaseModel):
+    """Response for batch document ingestion."""
+
+    documents: List[IngestResponse]
+    total_accepted: int
+    message: str = ""
+
+
+class BatchDeleteResponse(BaseModel):
+    """Response for batch document deletion."""
+
+    document_ids: List[UUID]
+    deleted_count: int
