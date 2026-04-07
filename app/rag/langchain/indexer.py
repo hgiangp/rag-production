@@ -121,7 +121,7 @@ class HierarchicalIndexer:
         points = [
             PointStruct(
                 id=abs(hash(doc.metadata["parent_id"])) % (2**63),
-                vector=[0.0],
+                vector=[1.0],  # dummy; parents are fetched by filter, not ANN
                 payload={"content": doc.page_content, **doc.metadata},
             )
             for doc in docs

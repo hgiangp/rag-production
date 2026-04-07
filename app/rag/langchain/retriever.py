@@ -37,7 +37,7 @@ class HierarchicalRetriever:
         client = vector_store_service.client
 
         for pid in parent_ids[:k]:
-            results = client.scroll(
+            results = await client.scroll(
                 collection_name=self._parent_collection,
                 scroll_filter={"must": [{"key": "parent_id", "match": {"value": pid}}]},
                 limit=1,
