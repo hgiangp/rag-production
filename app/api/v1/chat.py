@@ -15,7 +15,7 @@ from app.core.auth import CurrentUser, get_current_user
 from app.core.config import settings
 from app.core.limiter import limiter
 from app.evaluation.runner import EvalRunner
-from app.graph.main_graph import get_main_graph
+from app.graph.main_graph import get_langfuse_handler, get_main_graph
 from app.graph.state import GraphState
 from app.schemas.chat import (
     ChatRequest,
@@ -139,9 +139,15 @@ async def chat_invoke(
         self_correction_count=0,
     )
 
+    langfuse_handler = get_langfuse_handler(
+        trace_id=correlation_id,
+        session_id=str(session_id),
+        user_id=str(current_user.user_id),
+    )
     config = {
         "configurable": {"thread_id": f"{current_user.user_id}:{session_id}"},
         "run_name": "rag_chat",
+        "callbacks": [langfuse_handler] if langfuse_handler else [],
     }
 
     try:
@@ -224,9 +230,15 @@ async def chat_stream(
             source_citations=[],
             self_correction_count=0,
         )
+        langfuse_handler = get_langfuse_handler(
+            trace_id=correlation_id,
+            session_id=str(session_id),
+            user_id=str(current_user.user_id),
+        )
         config = {
             "configurable": {"thread_id": f"{current_user.user_id}:{session_id}"},
             "run_name": "rag_chat_stream",
+            "callbacks": [langfuse_handler] if langfuse_handler else [],
         }
 
         try:

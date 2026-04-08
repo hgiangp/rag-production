@@ -134,12 +134,23 @@ async def _get_checkpointer() -> AsyncPostgresSaver:
     return checkpointer
 
 
-def get_langfuse_handler() -> Optional[CallbackHandler]:
-    """Return Langfuse callback handler if configured."""
+def get_langfuse_handler(
+    trace_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+) -> Optional[CallbackHandler]:
+    """Return a per-request Langfuse handler tied to a single trace.
+
+    Pass trace_id=correlation_id so all graph nodes and LLM calls appear
+    as nested spans under one trace in the Langfuse UI.
+    """
     if not settings.langfuse_enabled:
         return None
     return CallbackHandler(
         public_key=settings.LANGFUSE_PUBLIC_KEY,
         secret_key=settings.LANGFUSE_SECRET_KEY,
         host=settings.LANGFUSE_HOST,
+        trace_id=trace_id or None,
+        session_id=session_id or None,
+        user_id=user_id or None,
     )

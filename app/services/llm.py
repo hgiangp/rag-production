@@ -41,18 +41,8 @@ def _build_llm(model: str, temperature: float, framework: str) -> Any:
 
 
 def _build_langchain_llm(provider: str, model: str, temperature: float) -> BaseChatModel:
-    callbacks = []
-    if settings.langfuse_enabled:
-        from langfuse import Langfuse
-        from langfuse.langchain import CallbackHandler
-        # Langfuse singleton must be registered before CallbackHandler.__init__ calls get_client()
-        Langfuse(
-            public_key=settings.LANGFUSE_PUBLIC_KEY,
-            secret_key=settings.LANGFUSE_SECRET_KEY,
-            host=settings.LANGFUSE_HOST,
-        )
-        callbacks.append(CallbackHandler(public_key=settings.LANGFUSE_PUBLIC_KEY))
-
+    # Do NOT attach a CallbackHandler here — callers pass it via config["callbacks"]
+    # at invocation time so all LLM calls share a single parent trace per request.
     match provider:
         case "openai":
             from langchain_openai import ChatOpenAI
@@ -62,7 +52,6 @@ def _build_langchain_llm(provider: str, model: str, temperature: float) -> BaseC
                 max_tokens=settings.MAX_TOKENS,
                 openai_api_key=settings.OPENAI_API_KEY,
                 base_url=settings.LLM_BASE_URL or None,
-                callbacks=callbacks or None,
             )
         case "anthropic":
             from langchain_anthropic import ChatAnthropic
@@ -72,7 +61,6 @@ def _build_langchain_llm(provider: str, model: str, temperature: float) -> BaseC
                 max_tokens=settings.MAX_TOKENS,
                 anthropic_api_key=settings.ANTHROPIC_API_KEY,
                 anthropic_api_url=settings.ANTHROPIC_BASE_URL or None,
-                callbacks=callbacks or None,
             )
         case "ollama":
             from langchain_ollama import ChatOllama
@@ -80,7 +68,6 @@ def _build_langchain_llm(provider: str, model: str, temperature: float) -> BaseC
                 model=model,
                 temperature=temperature,
                 base_url=settings.OLLAMA_LLM_BASE_URL,
-                callbacks=callbacks or None,
             )
         case _:
             raise ValueError(f"Unknown LLM provider: {provider}")
