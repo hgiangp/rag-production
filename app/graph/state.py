@@ -56,3 +56,4 @@ class AgentState(TypedDict, total=False):
     answer: str                        # this agent's final answer
     self_correction_count: int
     user_id: str                       # propagated from GraphState for tool collection routing
+    correlation_id: str                # propagated for Langfuse span linking inside tools

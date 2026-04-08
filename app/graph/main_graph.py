@@ -54,6 +54,7 @@ async def _run_agents(state: GraphState, agent_subgraph) -> dict:
             "question": question,
             "self_correction_count": 0,
             "user_id": state.get("user_id", ""),
+            "correlation_id": state.get("correlation_id", ""),
         })
         answer = result.get("answer", "")
         if answer:

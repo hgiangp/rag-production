@@ -322,6 +322,12 @@ See `app/graph/state.py`. Current fields:
 - `correlation_id`: str — request correlation ID
 - `self_correction_count`: int — iterations of self-correction
 
+`AgentState` additional fields (agent subgraph only):
+- `question`: str — the sub-question this agent is answering
+- `context_summary`: str — compressed context from prior tool calls
+- `answer`: str — this agent's final answer
+- `correlation_id`: str — propagated from GraphState for Langfuse span linking inside tools
+
 ### R15 — Evaluation Uses a Separate LLM (settings.EVALUATION_LLM)
 The inference LLM and evaluation LLM are always different instances to avoid self-serving bias.
 

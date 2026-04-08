@@ -5,10 +5,12 @@ Handles two reference types found in technical specification documents:
   Case 1 — Intra-document section refs:
     "see section 3.1.2.3", "refer to 4.2", "3.1.2.3項"
     → Fetch the target section from the SAME document (filter: document_id + section_number)
+    → Fallback: semantic search within same document if section_number is mis-tagged by Dockling
 
   Case 2 — Inter-document spec refs:
-    "refer to spec 'EnlargeWA'", "(EnlargeWA)"
-    → Fetch intro/summary chunks from the named spec (filter: spec_name)
+    "refer to spec 'EnlargeWA'", "(EnlargeWA)", "refer to spec EnlargeWA"
+    → Semantic search within the named spec (filter: spec_name) using the reference
+      context as the query — returns the most relevant chunks, not arbitrary ones
 
 Also handles: Table refs, Figure refs, Appendix refs, Requirement IDs.
 
@@ -20,11 +22,15 @@ Document filename convention:
 Loop protection: visited sets prevent re-fetching the same section/spec within one
 resolution call. Max depth is enforced per call (not recursive here — callers manage
 depth if they chain calls).
+
+Parallelism: all fetch tasks within a single resolution call are executed concurrently
+via asyncio.gather.
 """
 
+import asyncio
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from typing import Awaitable, Callable, Dict, List, Optional, Set
 
 import structlog
 from qdrant_client import AsyncQdrantClient
@@ -112,9 +118,12 @@ class CrossReferenceDetector:
 
     # ---- Document / spec patterns ------------------------------------------
     DOC_PATTERNS = [
-        # refer to spec 'EnlargeWA' / "EnlargeWA" / `EnlargeWA`
+        # refer to spec 'EnlargeWA' / "EnlargeWA" / `EnlargeWA` — quoted name
         r"(?:refer to|see|as per|defined in|per)\s+"
         r"(?:spec(?:ification)?|document|doc|仕様書?)\s*['\"`「『]([^'\"`」』]+)['\"`」』]",
+        # refer to spec EnlargeWA — no quotes, keyword required
+        r"(?:refer to|see|as per|defined in|per)\s+"
+        r"(?:spec(?:ification)?|document|doc)\s+([A-Z][A-Za-z0-9_\-]{2,})\b",
         # 'EnlargeWA' specification  (quoted name before keyword)
         r"['\"`「『]([A-Za-z0-9_\-]+)['\"`」』]\s+(?:spec(?:ification)?|document|仕様)",
         # (EnlargeWA) — parenthesised spec name (alphanumeric, first letter upper)
@@ -171,7 +180,8 @@ class CrossReferenceDetector:
         """Quick check — avoids full detection when text is clean."""
         quick_patterns = [
             r"section\s+\d", r"\d+\.\d+(?:\.\d+)+", r"[項節章]",
-            r"spec(?:ification)?['\"`「]", r"\([A-Z][A-Za-z0-9]+\)",
+            r"spec(?:ification)?\s*['\"`「『]", r"spec(?:ification)?\s+[A-Z]",
+            r"\([A-Z][A-Za-z0-9]+\)",
         ]
         return any(re.search(p, text, re.IGNORECASE) for p in quick_patterns)
 
@@ -179,16 +189,31 @@ class CrossReferenceDetector:
 # ── Retriever ─────────────────────────────────────────────────────────────────
 
 class CrossReferenceRetriever:
-    """Resolves cross-references from retrieved chunks using Qdrant payload filters.
+    """Resolves cross-references from retrieved chunks using Qdrant payload filters
+    and semantic vector search.
+
+    Strategy:
+      Section refs — try exact (document_id + section_number) filter first;
+        fall back to semantic search within the same document when the section
+        number is mis-tagged (e.g. Dockling numbering errors).
+      Spec refs    — use semantic search filtered by spec_name so the most
+        relevant chunks from the referenced spec are returned, not arbitrary ones.
+
+    All fetch tasks within a resolution call run in parallel via asyncio.gather.
 
     Usage:
-        retriever = CrossReferenceRetriever(aclient)
+        retriever = CrossReferenceRetriever(aclient, embed_fn=_embed_query)
         extra = await retriever.resolve_from_nodes(nodes, collection)
     """
 
-    def __init__(self, qdrant_client: AsyncQdrantClient) -> None:
+    def __init__(
+        self,
+        qdrant_client: AsyncQdrantClient,
+        embed_fn: Optional[Callable[[str], Awaitable[List[float]]]] = None,
+    ) -> None:
         self._client = qdrant_client
         self._detector = CrossReferenceDetector()
+        self._embed = embed_fn
 
     async def resolve_from_nodes(
         self,
@@ -201,6 +226,7 @@ class CrossReferenceRetriever:
 
         Each node must have metadata with at least 'document_id'.
         Loop-safe: visited sets prevent fetching the same target twice.
+        All fetches run in parallel via asyncio.gather.
 
         Returns:
             Flat list of formatted context strings ready to append to the LLM prompt.
@@ -208,10 +234,10 @@ class CrossReferenceRetriever:
         if not nodes:
             return []
 
-        visited_sections: Set[str] = set()   # "doc_id::section_number"
-        visited_docs: Set[str] = set()        # spec_name
+        visited_sections: Set[str] = set()
+        visited_docs: Set[str] = set()
 
-        # Pre-populate visited with the chunks we already have, so we don't re-fetch them
+        # Pre-populate visited with chunks we already have to avoid re-fetching them
         for node in nodes:
             doc_id = node.metadata.get("document_id", "")
             sec = node.metadata.get("section_number", "")
@@ -221,49 +247,84 @@ class CrossReferenceRetriever:
             if spec:
                 visited_docs.add(spec)
 
-        extra_contexts: List[str] = []
         col = _llama_collection(collection)
+        fetch_tasks = []
+        task_labels: List[tuple] = []  # (kind, label, section_or_spec)
 
         for node in nodes:
             text = getattr(node, "text", "") or ""
-            if not text or not self._detector.has_references(text):
+            if not text:
+                continue
+
+            has_refs = self._detector.has_references(text)
+            logger.debug(
+                "cross_ref_detector_check",
+                has_references=has_refs,
+                text_preview=text[:120].replace("\n", " "),
+            )
+            if not has_refs:
                 continue
 
             refs = self._detector.detect(text)
+            logger.debug(
+                "cross_ref_detected",
+                section_ref_count=len(refs.section_refs),
+                doc_ref_count=len(refs.document_refs),
+                section_numbers=[r.section_number for r in refs.section_refs],
+                spec_names=[r.spec_name for r in refs.document_refs],
+            )
             if refs.is_empty():
                 continue
 
             doc_id = node.metadata.get("document_id", "")
 
-            # ── Intra-document section references ────────────────────────────
             for ref in refs.section_refs[:max_section_refs]:
                 key = f"{doc_id}::{ref.section_number}"
                 if key in visited_sections:
                     continue
                 visited_sections.add(key)
+                fetch_tasks.append(
+                    self._fetch_by_section(col, doc_id, ref.section_number, query_context=text)
+                )
+                task_labels.append(("section", ref.section_number))
 
-                chunks = await self._fetch_by_section(col, doc_id, ref.section_number)
-                for chunk in chunks:
-                    extra_contexts.append(
-                        f"[Cross-ref: section {ref.section_number} in same document]\n{chunk}"
-                    )
-
-            # ── Inter-document spec references ───────────────────────────────
             for ref in refs.document_refs[:max_doc_refs]:
                 if ref.spec_name in visited_docs:
                     continue
                 visited_docs.add(ref.spec_name)
+                fetch_tasks.append(
+                    self._fetch_by_spec(col, ref.spec_name, query_context=text)
+                )
+                task_labels.append(("spec", ref.spec_name))
 
-                chunks = await self._fetch_by_spec(col, ref.spec_name)
-                for chunk in chunks:
-                    extra_contexts.append(
-                        f"[Cross-ref: specification '{ref.spec_name}']\n{chunk}"
-                    )
+        if not fetch_tasks:
+            logger.info(
+                "cross_references_resolved",
+                collection=collection,
+                node_count=len(nodes),
+                extra_context_count=0,
+            )
+            return []
+
+        # Run all fetches in parallel
+        results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+
+        extra_contexts: List[str] = []
+        for (kind, label), result in zip(task_labels, results):
+            if isinstance(result, Exception):
+                logger.warning("cross_ref_fetch_failed", kind=kind, label=label, error=str(result))
+                continue
+            for chunk in result:
+                if kind == "section":
+                    extra_contexts.append(f"[Cross-ref: section {label} in same document]\n{chunk}")
+                else:
+                    extra_contexts.append(f"[Cross-ref: specification '{label}']\n{chunk}")
 
         logger.info(
             "cross_references_resolved",
             collection=collection,
             node_count=len(nodes),
+            tasks_count=len(fetch_tasks),
             extra_context_count=len(extra_contexts),
         )
         return extra_contexts
@@ -280,91 +341,213 @@ class CrossReferenceRetriever:
 
         Used by the explicit `resolve_cross_references` agent tool when the agent
         has already identified a chunk that needs reference expansion.
+        All fetches run in parallel via asyncio.gather.
         """
-        if not self._detector.has_references(text):
+        has_refs = self._detector.has_references(text)
+        logger.debug(
+            "cross_ref_detector_check",
+            has_references=has_refs,
+            text_preview=text[:120].replace("\n", " "),
+        )
+        if not has_refs:
             return []
 
         refs = self._detector.detect(text)
+        logger.debug(
+            "cross_ref_detected",
+            section_ref_count=len(refs.section_refs),
+            doc_ref_count=len(refs.document_refs),
+            section_numbers=[r.section_number for r in refs.section_refs],
+            spec_names=[r.spec_name for r in refs.document_refs],
+        )
         if refs.is_empty():
             return []
 
         col = _llama_collection(collection)
-        extra: List[str] = []
+        fetch_tasks = []
+        task_labels: List[tuple] = []
 
         for ref in refs.section_refs[:max_section_refs]:
-            chunks = await self._fetch_by_section(col, document_id, ref.section_number)
-            extra.extend(
-                f"[Cross-ref: section {ref.section_number}]\n{c}" for c in chunks
+            fetch_tasks.append(
+                self._fetch_by_section(col, document_id, ref.section_number, query_context=text)
             )
+            task_labels.append(("section", ref.section_number))
 
         for ref in refs.document_refs[:max_doc_refs]:
-            chunks = await self._fetch_by_spec(col, ref.spec_name)
-            extra.extend(
-                f"[Cross-ref: spec '{ref.spec_name}']\n{c}" for c in chunks
+            fetch_tasks.append(
+                self._fetch_by_spec(col, ref.spec_name, query_context=text)
             )
+            task_labels.append(("spec", ref.spec_name))
+
+        results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+
+        extra: List[str] = []
+        for (kind, label), result in zip(task_labels, results):
+            if isinstance(result, Exception):
+                logger.warning("cross_ref_fetch_failed", kind=kind, label=label, error=str(result))
+                continue
+            for chunk in result:
+                if kind == "section":
+                    extra.append(f"[Cross-ref: section {label}]\n{chunk}")
+                else:
+                    extra.append(f"[Cross-ref: spec '{label}']\n{chunk}")
 
         return extra
 
     # ── Qdrant helpers ────────────────────────────────────────────────────────
 
     async def _fetch_by_section(
-        self, collection: str, document_id: str, section_number: str, limit: int = 2
+        self,
+        collection: str,
+        document_id: str,
+        section_number: str,
+        limit: int = 2,
+        query_context: str = "",
     ) -> List[str]:
-        """Filter: same document_id + exact section_number match."""
+        """Fetch section chunks with three-tier strategy:
+
+        1. Exact filter: document_id + section_number
+        2. Parent prefix: e.g. "3.1.2" when "3.1.2.3" has no match
+        3. Semantic fallback: vector search within same document
+           (handles Dockling mis-numbering — uses surrounding context as query)
+        """
         if not document_id:
             return []
         try:
-            results, _ = await self._client.scroll(
-                collection_name=collection,
-                scroll_filter=Filter(must=[
-                    FieldCondition(key="document_id", match=MatchValue(value=document_id)),
-                    FieldCondition(key="section_number", match=MatchValue(value=section_number)),
-                ]),
-                limit=limit,
-                with_payload=True,
-            )
-
-            chunks = [p.payload["text"] for p in results if p.payload and "text" in p.payload]
-
-            # Fallback: section may not have been tagged — search by prefix
-            # (e.g. stored as "3.1.2" but referenced as "3.1.2.3")
-            if not chunks and "." in section_number:
-                parent_section = section_number.rsplit(".", 1)[0]
-                chunks = await self._fetch_by_section(collection, document_id, parent_section, limit)
-
+            # Tier 1: exact section filter
+            chunks = await self._scroll_by_section(collection, document_id, section_number, limit)
             logger.debug(
-                "section_ref_fetched",
+                "section_filter_result",
                 document_id=document_id,
                 section=section_number,
                 found=len(chunks),
+                tier=1,
             )
+
+            # Tier 2: parent prefix (e.g. "3.1.2" when "3.1.2.3" not tagged)
+            if not chunks and "." in section_number:
+                parent = section_number.rsplit(".", 1)[0]
+                chunks = await self._scroll_by_section(collection, document_id, parent, limit)
+                logger.debug(
+                    "section_filter_result",
+                    document_id=document_id,
+                    section=parent,
+                    found=len(chunks),
+                    tier=2,
+                )
+
+            # Tier 3: semantic fallback — section tag may be wrong (Dockling numbering)
+            if not chunks and query_context and self._embed:
+                logger.debug(
+                    "section_semantic_fallback_triggered",
+                    document_id=document_id,
+                    section=section_number,
+                )
+                vector = await self._embed(query_context)
+                sem_results = await self._client.search(
+                    collection_name=collection,
+                    query_vector=vector,
+                    query_filter=Filter(must=[
+                        FieldCondition(key="document_id", match=MatchValue(value=document_id)),
+                    ]),
+                    limit=limit,
+                    with_payload=True,
+                )
+                chunks = [
+                    r.payload["text"]
+                    for r in sem_results
+                    if r.payload and "text" in r.payload
+                ]
+                logger.debug(
+                    "section_filter_result",
+                    document_id=document_id,
+                    section=section_number,
+                    found=len(chunks),
+                    tier=3,
+                )
+
             return chunks
 
         except Exception as exc:
             logger.warning("section_fetch_error", section=section_number, error=str(exc))
             return []
 
-    async def _fetch_by_spec(
-        self, collection: str, spec_name: str, limit: int = 3
+    async def _scroll_by_section(
+        self, collection: str, document_id: str, section_number: str, limit: int
     ) -> List[str]:
-        """Filter: spec_name matches the referenced specification name."""
+        """Scroll filter: document_id + exact section_number."""
+        results, _ = await self._client.scroll(
+            collection_name=collection,
+            scroll_filter=Filter(must=[
+                FieldCondition(key="document_id", match=MatchValue(value=document_id)),
+                FieldCondition(key="section_number", match=MatchValue(value=section_number)),
+            ]),
+            limit=limit,
+            with_payload=True,
+        )
+        return [p.payload["text"] for p in results if p.payload and "text" in p.payload]
+
+    async def _fetch_by_spec(
+        self,
+        collection: str,
+        spec_name: str,
+        limit: int = 3,
+        query_context: str = "",
+    ) -> List[str]:
+        """Fetch chunks from a referenced specification.
+
+        When query_context + embed_fn are available: semantic search filtered by
+        spec_name — returns the chunks most relevant to the referencing text, not
+        arbitrary first-N chunks.
+
+        Falls back to scroll filter when no embedding function is provided.
+        """
         try:
-            results, _ = await self._client.scroll(
-                collection_name=collection,
-                scroll_filter=Filter(must=[
-                    FieldCondition(key="spec_name", match=MatchValue(value=spec_name)),
-                ]),
-                limit=limit,
-                with_payload=True,
-            )
+            if query_context and self._embed:
+                # Semantic search: query = surrounding context, filter = spec_name
+                vector = await self._embed(query_context)
+                results = await self._client.search(
+                    collection_name=collection,
+                    query_vector=vector,
+                    query_filter=Filter(must=[
+                        FieldCondition(key="spec_name", match=MatchValue(value=spec_name)),
+                    ]),
+                    limit=limit,
+                    with_payload=True,
+                )
+                chunks = []
+                for r in results:
+                    if r.payload and "text" in r.payload:
+                        fname = r.payload.get("filename", "")
+                        chunks.append(f"{r.payload['text']}\n[Source: {fname}]")
+                logger.debug(
+                    "spec_ref_fetched",
+                    spec_name=spec_name,
+                    found=len(chunks),
+                    method="semantic",
+                )
+            else:
+                # Fallback: scroll filter (no embedding available)
+                results, _ = await self._client.scroll(
+                    collection_name=collection,
+                    scroll_filter=Filter(must=[
+                        FieldCondition(key="spec_name", match=MatchValue(value=spec_name)),
+                    ]),
+                    limit=limit,
+                    with_payload=True,
+                )
+                chunks = []
+                for p in results:
+                    if p.payload and "text" in p.payload:
+                        fname = p.payload.get("filename", "")
+                        chunks.append(f"{p.payload['text']}\n[Source: {fname}]")
+                logger.debug(
+                    "spec_ref_fetched",
+                    spec_name=spec_name,
+                    found=len(chunks),
+                    method="filter_scroll",
+                )
 
-            chunks = []
-            for p in results:
-                if p.payload and "text" in p.payload:
-                    fname = p.payload.get("filename", "")
-                    chunks.append(f"{p.payload['text']}\n[Source: {fname}]")
-
-            logger.debug("spec_ref_fetched", spec_name=spec_name, found=len(chunks))
             return chunks
 
         except Exception as exc:

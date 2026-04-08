@@ -14,6 +14,7 @@ Two tools are exposed to the agent:
                            Use for: multi-hop questions that span several sections.
 """
 
+import asyncio
 import time
 from pathlib import Path
 from typing import Annotated, Dict, List, Literal, Optional, Tuple
@@ -38,6 +39,30 @@ logger = structlog.get_logger(__name__)
 
 # Cache: (collection, mode) → LlamaQueryEngine
 _engines: Dict[Tuple[str, str], LlamaQueryEngine] = {}
+
+# Lazy Langfuse client singleton — used for manual spans inside tools
+_langfuse = None
+
+
+def _get_langfuse():
+    global _langfuse
+    if not settings.langfuse_enabled:
+        return None
+    if _langfuse is None:
+        from langfuse import Langfuse
+        _langfuse = Langfuse(
+            public_key=settings.LANGFUSE_PUBLIC_KEY,
+            secret_key=settings.LANGFUSE_SECRET_KEY,
+            host=settings.LANGFUSE_HOST,
+        )
+    return _langfuse
+
+
+async def _embed_query(text: str) -> List[float]:
+    """Embed text via the configured model (runs in executor to avoid blocking event loop)."""
+    from app.services.embedding import embedding_service
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, embedding_service.model.embed_query, text)
 
 
 async def _get_engine(collection: str, mode: Literal["auto_merging", "recursive"]) -> LlamaQueryEngine:
@@ -134,8 +159,8 @@ def get_llamaindex_tools() -> List:
           recursive    — walks up the heading tree from matched leaves.
             Best for multi-hop questions spanning several sections.
 
-        Use this AFTER search_child_chunks returns insufficient or shallow context,
-        or for complex questions that require cross-section reasoning.
+        Use for any question requiring document retrieval. Prefer mode='recursive'
+        for multi-hop questions that span several sections.
 
         Args:
             query: The search query.
@@ -155,6 +180,8 @@ def get_llamaindex_tools() -> List:
 
             # Auto-resolve cross-references transparently — no agent action needed.
             # Uses document_id from node metadata; loop-safe via visited sets.
+            # Passes embed_fn so _fetch_by_spec uses semantic search and
+            # _fetch_by_section falls back to semantic when section tag is wrong.
             extra_contexts: List[str] = []
             detector = CrossReferenceDetector()
             if any(detector.has_references(getattr(n, "text", "")) for n in nodes):
@@ -163,8 +190,30 @@ def get_llamaindex_tools() -> List:
                     port=settings.QDRANT_PORT,
                     api_key=settings.QDRANT_API_KEY or None,
                 )
-                retriever = CrossReferenceRetriever(aclient)
+                retriever = CrossReferenceRetriever(aclient, embed_fn=_embed_query)
+
+                # Create Langfuse span so cross-ref resolution is visible in the trace
+                correlation_id = state.get("correlation_id", "")
+                lf = _get_langfuse()
+                lf_span = None
+                if lf and correlation_id:
+                    try:
+                        lf_trace_id = correlation_id.replace("-", "")
+                        lf_span = lf.span(
+                            trace_id=lf_trace_id,
+                            name="cross_reference_resolution",
+                            input={"node_count": len(nodes), "collection": collection},
+                        )
+                    except Exception:
+                        pass
+
                 extra_contexts = await retriever.resolve_from_nodes(nodes, collection)
+
+                if lf_span:
+                    try:
+                        lf_span.end(output={"extra_context_count": len(extra_contexts)})
+                    except Exception:
+                        pass
 
             # Format retrieved nodes directly — no LLM synthesis here.
             # LangGraph orchestrator handles synthesis from this context.
@@ -232,7 +281,7 @@ def get_llamaindex_tools() -> List:
                 port=settings.QDRANT_PORT,
                 api_key=settings.QDRANT_API_KEY or None,
             )
-            retriever = CrossReferenceRetriever(aclient)
+            retriever = CrossReferenceRetriever(aclient, embed_fn=_embed_query)
             extra_contexts = await retriever.resolve_from_text(
                 text=chunk_text,
                 document_id=document_id,
