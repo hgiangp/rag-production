@@ -19,8 +19,8 @@ from typing import Dict, List
 
 import structlog
 from llama_index.core import Settings as LISettings, StorageContext, VectorStoreIndex
-from llama_index.core.node_parser import MarkdownNodeParser
-from llama_index.core.schema import BaseNode
+from llama_index.core.node_parser import MarkdownNodeParser, SentenceSplitter
+from llama_index.core.schema import BaseNode, TextNode
 from llama_index.core.storage.docstore import SimpleDocumentStore
 from llama_index.node_parser.docling import DoclingNodeParser
 from llama_index.readers.docling import DoclingReader
@@ -309,8 +309,22 @@ def _parse_with_docling(
     # Parse into nodes
     nodes = node_parser.get_nodes_from_documents(documents)
 
-    # Ensure all nodes have the document metadata
+    # Split oversized nodes to fit embedding model context window
+    splitter = SentenceSplitter(
+        chunk_size=settings.LLAMAINDEX_CHUNK_SIZE,
+        chunk_overlap=settings.LLAMAINDEX_CHUNK_OVERLAP,
+    )
+    final_nodes: List[BaseNode] = []
     for node in nodes:
+        if isinstance(node, TextNode) and len(node.text) > settings.LLAMAINDEX_CHUNK_SIZE * 4:
+            # Node is likely too large, split it
+            split_nodes = splitter.get_nodes_from_documents([node])
+            final_nodes.extend(split_nodes)
+        else:
+            final_nodes.append(node)
+
+    # Ensure all nodes have the document metadata
+    for node in final_nodes:
         node.metadata["document_id"] = document_id
         node.metadata["filename"] = filename
 
@@ -319,11 +333,12 @@ def _parse_with_docling(
         filename=filename,
         document_id=document_id,
         num_documents=len(documents),
-        num_nodes=len(nodes),
+        num_nodes=len(final_nodes),
+        nodes_before_split=len(nodes),
         parser_mode=mode,
     )
 
-    return nodes
+    return final_nodes
 
 
 def _load_docstore(path: Path) -> SimpleDocumentStore:

@@ -151,6 +151,9 @@ class Settings:
         self.LLAMAINDEX_DOCSTORE_PATH: str = os.getenv("LLAMAINDEX_DOCSTORE_PATH", "data/docstore")
         # Parser mode: "markdown" (simpler, MarkdownNodeParser) or "docling" (richer, DoclingNodeParser with JSON)
         self.LLAMAINDEX_PARSER_MODE: str = os.getenv("LLAMAINDEX_PARSER_MODE", "markdown")
+        # Max chunk size for embedding (must fit in embedding model context, e.g. 512 for BGE-small)
+        self.LLAMAINDEX_CHUNK_SIZE: int = _int("LLAMAINDEX_CHUNK_SIZE", 400)
+        self.LLAMAINDEX_CHUNK_OVERLAP: int = _int("LLAMAINDEX_CHUNK_OVERLAP", 50)
 
         # ── Reranking ────────────────────────────────────────────────────────
         self.COHERE_API_KEY: str = os.getenv("COHERE_API_KEY", "")
