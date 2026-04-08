@@ -146,10 +146,9 @@ def get_langfuse_handler(
     """
     if not settings.langfuse_enabled:
         return None
+    # Credentials come from the global Langfuse singleton initialised at startup.
+    # CallbackHandler only accepts trace-context kwargs in Langfuse v3.
     return CallbackHandler(
-        public_key=settings.LANGFUSE_PUBLIC_KEY,
-        secret_key=settings.LANGFUSE_SECRET_KEY,
-        host=settings.LANGFUSE_HOST,
         trace_id=trace_id or None,
         session_id=session_id or None,
         user_id=user_id or None,
