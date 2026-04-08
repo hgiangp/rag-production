@@ -146,7 +146,9 @@ def get_langfuse_handler(
     # TraceContext pins all downstream spans to one trace identified by correlation_id.
     # session_id / user_id are set on the Langfuse client, not the handler.
     from langfuse.types import TraceContext
-    ctx: TraceContext = {"trace_id": trace_id} if trace_id else {}
+    # Langfuse requires trace_id as 32 lowercase hex chars — strip UUID dashes.
+    lf_trace_id = trace_id.replace("-", "") if trace_id else None
+    ctx: TraceContext = {"trace_id": lf_trace_id} if lf_trace_id else {}
     return CallbackHandler(
         public_key=settings.LANGFUSE_PUBLIC_KEY,
         trace_context=ctx or None,

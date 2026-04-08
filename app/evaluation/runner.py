@@ -76,9 +76,11 @@ class EvalRunner:
                 secret_key=settings.LANGFUSE_SECRET_KEY,
                 host=settings.LANGFUSE_HOST,
             )
-            lf.score(trace_id=trace_id, name="context_relevance", value=cr)
-            lf.score(trace_id=trace_id, name="groundedness", value=gd)
-            lf.score(trace_id=trace_id, name="answer_relevance", value=ar)
+            # Normalize to 32-char hex to match how the CallbackHandler stores the trace.
+            lf_trace_id = trace_id.replace("-", "")
+            lf.score(trace_id=lf_trace_id, name="context_relevance", value=cr)
+            lf.score(trace_id=lf_trace_id, name="groundedness", value=gd)
+            lf.score(trace_id=lf_trace_id, name="answer_relevance", value=ar)
         except Exception as exc:
             logger.warning("langfuse_score_failed", trace_id=trace_id, error=str(exc))
 
