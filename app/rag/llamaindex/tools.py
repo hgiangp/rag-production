@@ -47,9 +47,8 @@ async def _get_engine(collection: str, mode: Literal["auto_merging", "recursive"
         return _engines[key]
 
     from app.services.embedding import embedding_service
-    from app.services.llm import get_llm
 
-    LISettings.llm = get_llm(model=settings.DEFAULT_LLM_MODEL, framework="llamaindex")
+    # No LLM needed — tool returns raw retrieved context; LangGraph orchestrator synthesizes.
     LISettings.embed_model = embedding_service.llamaindex_model
 
     # Load persisted docstore (contains all nodes: leaf + parent sections)
@@ -167,8 +166,15 @@ def get_llamaindex_tools() -> List:
                 retriever = CrossReferenceRetriever(aclient)
                 extra_contexts = await retriever.resolve_from_nodes(nodes, collection)
 
-            # Format primary result
-            result = await engine.query(query)
+            # Format retrieved nodes directly — no LLM synthesis here.
+            # LangGraph orchestrator handles synthesis from this context.
+            if nodes:
+                result = "\n---\n".join(
+                    f"[Source: {n.metadata.get('filename', 'unknown')}]\n{n.get_content()}"
+                    for n in nodes
+                )
+            else:
+                result = "No relevant content found."
 
             # Append resolved cross-reference context
             if extra_contexts:
