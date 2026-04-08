@@ -139,11 +139,7 @@ async def chat_invoke(
         self_correction_count=0,
     )
 
-    langfuse_handler = get_langfuse_handler(
-        trace_id=correlation_id,
-        session_id=str(session_id),
-        user_id=str(current_user.user_id),
-    )
+    langfuse_handler = get_langfuse_handler(trace_id=correlation_id)
     config = {
         "configurable": {"thread_id": f"{current_user.user_id}:{session_id}"},
         "run_name": "rag_chat",
@@ -230,11 +226,7 @@ async def chat_stream(
             source_citations=[],
             self_correction_count=0,
         )
-        langfuse_handler = get_langfuse_handler(
-            trace_id=correlation_id,
-            session_id=str(session_id),
-            user_id=str(current_user.user_id),
-        )
+        langfuse_handler = get_langfuse_handler(trace_id=correlation_id)
         config = {
             "configurable": {"thread_id": f"{current_user.user_id}:{session_id}"},
             "run_name": "rag_chat_stream",

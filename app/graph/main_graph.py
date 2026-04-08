@@ -136,20 +136,18 @@ async def _get_checkpointer() -> AsyncPostgresSaver:
 
 def get_langfuse_handler(
     trace_id: Optional[str] = None,
-    session_id: Optional[str] = None,
-    user_id: Optional[str] = None,
 ) -> Optional[CallbackHandler]:
-    """Return a per-request Langfuse handler tied to a single trace.
+    """Return a per-request Langfuse handler pinned to trace_id (correlation_id).
 
-    Pass trace_id=correlation_id so all graph nodes and LLM calls appear
-    as nested spans under one trace in the Langfuse UI.
+    All graph nodes and LLM calls will appear as nested spans under one trace.
     """
     if not settings.langfuse_enabled:
         return None
-    # Credentials come from the global Langfuse singleton initialised at startup.
-    # CallbackHandler only accepts trace-context kwargs in Langfuse v3.
+    # TraceContext pins all downstream spans to one trace identified by correlation_id.
+    # session_id / user_id are set on the Langfuse client, not the handler.
+    from langfuse.types import TraceContext
+    ctx: TraceContext = {"trace_id": trace_id} if trace_id else {}
     return CallbackHandler(
-        trace_id=trace_id or None,
-        session_id=session_id or None,
-        user_id=user_id or None,
+        public_key=settings.LANGFUSE_PUBLIC_KEY,
+        trace_context=ctx or None,
     )
