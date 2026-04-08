@@ -97,8 +97,16 @@ class Settings:
         self.MAX_LLM_CALL_RETRIES: int = _int("MAX_LLM_CALL_RETRIES", 3)
         self.OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
         self.ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+        # Ollama — shared fallback; override per-role below
         self.OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
         self.OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3.2")
+        # Per-role Ollama URLs (default to the shared URL above)
+        self.OLLAMA_LLM_BASE_URL: str = os.getenv("OLLAMA_LLM_BASE_URL", self.OLLAMA_BASE_URL)
+        self.OLLAMA_EMBEDDING_BASE_URL: str = os.getenv("OLLAMA_EMBEDDING_BASE_URL", self.OLLAMA_BASE_URL)
+        # OpenAI-compatible custom base URLs (empty = use official API)
+        # Use these to point to vLLM, LM Studio, or any OpenAI-compatible proxy
+        self.LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", "")
+        self.ANTHROPIC_BASE_URL: str = os.getenv("ANTHROPIC_BASE_URL", "")
 
         # ── LLM (Evaluation) ─────────────────────────────────────────────────
         self.EVALUATION_LLM: str = os.getenv("EVALUATION_LLM", "gpt-4o")
@@ -110,6 +118,10 @@ class Settings:
         self.EMBEDDING_PROVIDER: str = os.getenv("EMBEDDING_PROVIDER", "huggingface")
         self.EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
         self.EMBEDDING_BATCH_SIZE: int = _int("EMBEDDING_BATCH_SIZE", 32)
+        # OpenAI-compatible custom base URL for embeddings (empty = use official API)
+        self.EMBEDDING_BASE_URL: str = os.getenv("EMBEDDING_BASE_URL", "")
+        # Separate API key for embedding service (defaults to OPENAI_API_KEY)
+        self.OPENAI_EMBEDDING_API_KEY: str = os.getenv("OPENAI_EMBEDDING_API_KEY", self.OPENAI_API_KEY)
 
         # ── Database ─────────────────────────────────────────────────────────
         self.POSTGRES_HOST: str = os.getenv("POSTGRES_HOST", "localhost")

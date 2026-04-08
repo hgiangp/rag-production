@@ -68,13 +68,14 @@ class EmbeddingService:
                 from langchain_openai import OpenAIEmbeddings
                 return OpenAIEmbeddings(
                     model=settings.EMBEDDING_MODEL,
-                    openai_api_key=settings.OPENAI_API_KEY,
+                    openai_api_key=settings.OPENAI_EMBEDDING_API_KEY,
+                    base_url=settings.EMBEDDING_BASE_URL or None,
                 )
             case "ollama":
                 from langchain_ollama import OllamaEmbeddings
                 return OllamaEmbeddings(
                     model=settings.EMBEDDING_MODEL,
-                    base_url=settings.OLLAMA_BASE_URL,
+                    base_url=settings.OLLAMA_EMBEDDING_BASE_URL,
                 )
             case _:
                 raise ValueError(f"Unknown embedding provider: {settings.EMBEDDING_PROVIDER}")
@@ -86,12 +87,16 @@ class EmbeddingService:
                 return HuggingFaceEmbedding(model_name=settings.EMBEDDING_MODEL)
             case "openai":
                 from llama_index.embeddings.openai import OpenAIEmbedding
-                return OpenAIEmbedding(model=settings.EMBEDDING_MODEL, api_key=settings.OPENAI_API_KEY)
+                return OpenAIEmbedding(
+                    model=settings.EMBEDDING_MODEL,
+                    api_key=settings.OPENAI_EMBEDDING_API_KEY,
+                    api_base=settings.EMBEDDING_BASE_URL or None,
+                )
             case "ollama":
                 from llama_index.embeddings.ollama import OllamaEmbedding
                 return OllamaEmbedding(
                     model_name=settings.EMBEDDING_MODEL,
-                    base_url=settings.OLLAMA_BASE_URL,
+                    base_url=settings.OLLAMA_EMBEDDING_BASE_URL,
                 )
             case _:
                 from llama_index.embeddings.huggingface import HuggingFaceEmbedding

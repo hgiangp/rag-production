@@ -61,6 +61,7 @@ def _build_langchain_llm(provider: str, model: str, temperature: float) -> BaseC
                 temperature=temperature,
                 max_tokens=settings.MAX_TOKENS,
                 openai_api_key=settings.OPENAI_API_KEY,
+                base_url=settings.LLM_BASE_URL or None,
                 callbacks=callbacks or None,
             )
         case "anthropic":
@@ -70,6 +71,7 @@ def _build_langchain_llm(provider: str, model: str, temperature: float) -> BaseC
                 temperature=temperature,
                 max_tokens=settings.MAX_TOKENS,
                 anthropic_api_key=settings.ANTHROPIC_API_KEY,
+                anthropic_api_url=settings.ANTHROPIC_BASE_URL or None,
                 callbacks=callbacks or None,
             )
         case "ollama":
@@ -77,7 +79,7 @@ def _build_langchain_llm(provider: str, model: str, temperature: float) -> BaseC
             return ChatOllama(
                 model=model,
                 temperature=temperature,
-                base_url=settings.OLLAMA_BASE_URL,
+                base_url=settings.OLLAMA_LLM_BASE_URL,
                 callbacks=callbacks or None,
             )
         case _:
@@ -88,13 +90,23 @@ def _build_llamaindex_llm(provider: str, model: str, temperature: float) -> Any:
     match provider:
         case "openai":
             from llama_index.llms.openai import OpenAI
-            return OpenAI(model=model, temperature=temperature, api_key=settings.OPENAI_API_KEY)
+            return OpenAI(
+                model=model,
+                temperature=temperature,
+                api_key=settings.OPENAI_API_KEY,
+                api_base=settings.LLM_BASE_URL or None,
+            )
         case "anthropic":
             from llama_index.llms.anthropic import Anthropic
-            return Anthropic(model=model, temperature=temperature, api_key=settings.ANTHROPIC_API_KEY)
+            return Anthropic(
+                model=model,
+                temperature=temperature,
+                api_key=settings.ANTHROPIC_API_KEY,
+                base_url=settings.ANTHROPIC_BASE_URL or None,
+            )
         case "ollama":
             from llama_index.llms.ollama import Ollama
-            return Ollama(model=model, temperature=temperature, base_url=settings.OLLAMA_BASE_URL)
+            return Ollama(model=model, temperature=temperature, base_url=settings.OLLAMA_LLM_BASE_URL)
         case _:
             raise ValueError(f"Unknown LLM provider for LlamaIndex: {provider}")
 
