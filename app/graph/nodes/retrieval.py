@@ -1,11 +1,64 @@
-"""Retrieval nodes: token estimation and context compression routing."""
+"""Retrieval nodes: token estimation, context compression, cross-reference resolution."""
+
+from typing import List, Optional
 
 import structlog
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import HumanMessage, ToolMessage
+from pydantic import BaseModel
+from pydantic import Field as PydanticField
+from qdrant_client import AsyncQdrantClient
 
-from app.core.metrics import GRAPH_NODE_COUNT
+from app.core.config import settings
+from app.core.metrics import GRAPH_NODE_COUNT, GRAPH_NODE_LATENCY
+from app.graph.state import AgentState, CrossRefTarget
+from app.rag.llamaindex.cross_reference import (
+    CrossReferenceDetector,
+    CrossReferenceRetriever,
+    LLMCrossReferenceExtractor,
+)
 
 logger = structlog.get_logger(__name__)
 
+# Tool names whose results may contain cross-references.
+_RAG_TOOL_NAMES = {"llamaindex_query", "llamaindex_recursive", "search_child_chunks", "fetch_parent_chunks"}
+
+# ── Pydantic models for LLM structured extraction ────────────────────────────
+
+class _CrossRefTargetLLM(BaseModel):
+    spec_name: str = PydanticField(
+        description=(
+            "Target spec name for the Qdrant filter. "
+            "For intra-document section refs use the source chunk's spec (shown in [Source: spec=...])."
+        )
+    )
+    section_number: Optional[str] = PydanticField(
+        None,
+        description="Target section number if the ref points to a specific clause (e.g. '4.4.1.1'); omit otherwise.",
+    )
+    query: str = PydanticField(
+        description="Semantic search query describing what the referenced content covers.",
+    )
+
+
+class _CrossRefDetectionOutput(BaseModel):
+    targets: List[_CrossRefTargetLLM] = PydanticField(default_factory=list)
+
+
+_DETECT_SYSTEM = (
+    "You detect cross-references in retrieved document chunks.\n"
+    "A cross-reference is any pointer to content not already shown in the chunks:\n"
+    "  - A section or clause, e.g. '4.4.1.1', 'Section 3.2', '3.1.2.3項'\n"
+    "  - A different specification, e.g. 'EnlargeWA', 'SPEC \"Enlarge WA\"', '(EnlargeWA)'\n"
+    "  - A bare number in a 'Reference' table column — use column headers for context.\n"
+    "For intra-document section refs, set spec_name to the source chunk's spec "
+    "(visible in the [Source: spec=...] label).\n"
+    "Only return references to content that is NOT already present in the chunks above.\n"
+    "Return an empty list when there are no actionable cross-references."
+)
+
+
+# ── Nodes ─────────────────────────────────────────────────────────────────────
 
 def _estimate_tokens(text: str) -> int:
     """Rough token estimate: ~4 chars per token."""
@@ -16,3 +69,128 @@ def should_compress_context(state: dict) -> dict:
     """No-op node — routing logic is in edges.route_after_compression_check."""
     GRAPH_NODE_COUNT.labels(node="should_compress_context").inc()
     return {}
+
+
+async def detect_cross_references(state: AgentState, llm: BaseChatModel) -> dict:
+    """Scan recent RAG tool results for cross-references and extract structured targets.
+
+    Only inspects ToolMessages that arrived after the last cross-reference context
+    injection (identified by a HumanMessage starting with '[Cross-reference context]'),
+    so repeated passes through the node never re-process the same tool output.
+
+    Uses the regex CrossReferenceDetector as a cheap pre-screen; skips the LLM
+    call entirely when no candidate text is found.
+
+    Returns:
+        {"cross_ref_targets": [...]} — empty list if nothing detected.
+    """
+    GRAPH_NODE_COUNT.labels(node="detect_cross_references").inc()
+    messages = state.get("messages", [])
+
+    # Find the index of the last cross-ref context injection to avoid reprocessing.
+    last_injection_idx = -1
+    for i, m in enumerate(messages):
+        if isinstance(m, HumanMessage) and m.content.startswith("[Cross-reference context]"):
+            last_injection_idx = i
+
+    recent_tool_msgs = [
+        m for m in messages[last_injection_idx + 1:]
+        if isinstance(m, ToolMessage) and getattr(m, "name", "") in _RAG_TOOL_NAMES
+    ]
+
+    if not recent_tool_msgs:
+        return {"cross_ref_targets": []}
+
+    # Fast regex pre-screen — avoids LLM call on clean text.
+    detector = CrossReferenceDetector()
+    combined = "\n---\n".join(m.content for m in recent_tool_msgs if m.content)
+    if not detector.has_references(combined):
+        logger.debug("detect_cross_references_skipped", reason="no_refs_in_tool_output")
+        return {"cross_ref_targets": []}
+
+    # LLM structured extraction across all recent tool results in one call.
+    try:
+        structured_llm = llm.with_structured_output(_CrossRefDetectionOutput)
+        result: _CrossRefDetectionOutput = await structured_llm.ainvoke([
+            HumanMessage(content=f"{_DETECT_SYSTEM}\n\nChunks:\n{combined}"),
+        ])
+        targets: List[CrossRefTarget] = [
+            CrossRefTarget(
+                spec_name=t.spec_name,
+                section_number=t.section_number or "",
+                query=t.query,
+            )
+            for t in result.targets
+            if t.spec_name.strip()
+        ]
+    except Exception as exc:
+        logger.warning("detect_cross_references_llm_failed", error=str(exc))
+        return {"cross_ref_targets": []}
+
+    logger.info(
+        "cross_references_detected",
+        target_count=len(targets),
+        tool_msg_count=len(recent_tool_msgs),
+    )
+    GRAPH_NODE_LATENCY.labels(node="detect_cross_references")
+    return {"cross_ref_targets": targets}
+
+
+async def fetch_cross_ref_context(state: AgentState) -> dict:
+    """Fetch content for every CrossRefTarget, inject into messages, clear targets.
+
+    Targets are resolved via CrossReferenceRetriever which applies:
+      - Fuzzy spec_name matching (handles typos / case / spacing)
+      - 3-tier section fallback (exact → parent prefix → semantic within spec)
+      - Semantic-only fallback when spec_name is completely unresolvable
+
+    Fetched contexts are deduplicated against existing message content and
+    injected as a single HumanMessage so the orchestrator sees them naturally
+    in its next reasoning step.
+    """
+    GRAPH_NODE_COUNT.labels(node="fetch_cross_ref_context").inc()
+    targets = state.get("cross_ref_targets", [])
+    if not targets:
+        return {"cross_ref_targets": []}
+
+    collection = f"docs_{state['user_id']}"
+
+    try:
+        from app.rag.llamaindex.tools import _embed_query
+
+        aclient = AsyncQdrantClient(
+            host=settings.QDRANT_HOST,
+            port=settings.QDRANT_PORT,
+            api_key=settings.QDRANT_API_KEY or None,
+        )
+        retriever = CrossReferenceRetriever(aclient, embed_fn=_embed_query)
+        contexts = await retriever.resolve_targets(list(targets), collection)
+    except Exception as exc:
+        logger.exception("fetch_cross_ref_context_failed", error=str(exc))
+        return {"cross_ref_targets": []}
+
+    if not contexts:
+        logger.info("fetch_cross_ref_context_empty", target_count=len(targets))
+        return {"cross_ref_targets": []}
+
+    # Deduplicate against all content already in the message history.
+    existing_content = {
+        m.content.strip()
+        for m in state.get("messages", [])
+        if hasattr(m, "content") and m.content
+    }
+    unique = [c for c in contexts if c.strip() not in existing_content]
+
+    if unique:
+        injection = "[Cross-reference context]\n" + "\n\n".join(unique)
+        logger.info(
+            "cross_ref_context_injected",
+            context_count=len(unique),
+            collection=collection,
+        )
+        return {
+            "messages": [HumanMessage(content=injection)],
+            "cross_ref_targets": [],   # clear — consumed
+        }
+
+    return {"cross_ref_targets": []}

@@ -42,6 +42,15 @@ def route_after_orchestrator(
     return "collect_answer"
 
 
+def route_after_cross_ref_detection(
+    state: AgentState,
+) -> Literal["fetch_cross_ref_context", "should_compress_context"]:
+    """After detect_cross_references: fetch if targets found, else continue."""
+    if state.get("cross_ref_targets"):
+        return "fetch_cross_ref_context"
+    return "should_compress_context"
+
+
 def route_after_compression_check(
     state: AgentState,
 ) -> Literal["compress_context", "orchestrator"]:

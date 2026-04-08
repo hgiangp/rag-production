@@ -1,6 +1,7 @@
 """Generation nodes: orchestrator, aggregate answers, fallback, collect answer."""
 
 import time
+from typing import List
 
 import structlog
 from langchain_core.language_models import BaseChatModel
@@ -123,9 +124,20 @@ async def aggregate_answers(state: GraphState, llm: BaseChatModel) -> dict:
     if not answers:
         return {"final_answer": "I could not find relevant information to answer your question."}
 
+    # Deduplicate retrieved_contexts accumulated across all tool calls.
+    # Multiple agents can retrieve the same chunks; clean contexts improve eval scoring.
+    raw_contexts = state.get("retrieved_contexts", [])
+    seen: set = set()
+    unique_contexts: List[str] = []
+    for ctx in raw_contexts:
+        h = hash(ctx.strip())
+        if h not in seen:
+            seen.add(h)
+            unique_contexts.append(ctx)
+
     if len(answers) == 1:
         GRAPH_NODE_LATENCY.labels(node="aggregate_answers").observe(time.perf_counter() - start)
-        return {"final_answer": answers[0]}
+        return {"final_answer": answers[0], "retrieved_contexts": unique_contexts}
 
     combined = "\n\n---\n\n".join(f"[Answer {i+1}]\n{a}" for i, a in enumerate(answers))
     prompt = f"Original question: {state.get('original_query', '')}\n\nAnswers to synthesize:\n{combined}"
@@ -137,4 +149,4 @@ async def aggregate_answers(state: GraphState, llm: BaseChatModel) -> dict:
 
     LLM_LATENCY.labels(model=settings.DEFAULT_LLM_MODEL, node="aggregate_answers").observe(time.perf_counter() - start)
     GRAPH_NODE_LATENCY.labels(node="aggregate_answers").observe(time.perf_counter() - start)
-    return {"final_answer": resp.content}
+    return {"final_answer": resp.content, "retrieved_contexts": unique_contexts}

@@ -31,7 +31,11 @@ from qdrant_client.models import PayloadSchemaType
 from app.core.config import settings
 from app.core.metrics import RETRIEVAL_LATENCY, RETRIEVAL_RESULTS
 from app.graph.state import AgentState
-from app.rag.llamaindex.cross_reference import CrossReferenceDetector, CrossReferenceRetriever
+from app.rag.llamaindex.cross_reference import (
+    CrossReferenceRetriever,
+    DocumentMetadata,
+    LLMCrossReferenceExtractor,
+)
 from app.rag.llamaindex.indexer import _collection_name, _docstore_path
 from app.rag.llamaindex.query_engine import LlamaQueryEngine
 
@@ -174,64 +178,31 @@ def get_llamaindex_tools() -> List:
         try:
             engine = await _get_engine(collection, mode)
 
-            # Retrieve raw nodes so we can inspect metadata (document_id, section_number)
-            # and auto-resolve any cross-references found in their text.
+            # Retrieve raw nodes — cross-reference detection and resolution is handled
+            # by the detect_cross_references + fetch_cross_ref_context graph nodes
+            # that run after this tool call completes.
             nodes = await engine.retrieve_nodes(query)
 
-            # Auto-resolve cross-references transparently — no agent action needed.
-            # Uses document_id from node metadata; loop-safe via visited sets.
-            # Passes embed_fn so _fetch_by_spec uses semantic search and
-            # _fetch_by_section falls back to semantic when section tag is wrong.
-            extra_contexts: List[str] = []
-            detector = CrossReferenceDetector()
-            if any(detector.has_references(getattr(n, "text", "")) for n in nodes):
-                aclient = AsyncQdrantClient(
-                    host=settings.QDRANT_HOST,
-                    port=settings.QDRANT_PORT,
-                    api_key=settings.QDRANT_API_KEY or None,
-                )
-                retriever = CrossReferenceRetriever(aclient, embed_fn=_embed_query)
-
-                # Create Langfuse span so cross-ref resolution is visible in the trace
-                correlation_id = state.get("correlation_id", "")
-                lf = _get_langfuse()
-                lf_span = None
-                if lf and correlation_id:
-                    try:
-                        lf_trace_id = correlation_id.replace("-", "")
-                        lf_span = lf.span(
-                            trace_id=lf_trace_id,
-                            name="cross_reference_resolution",
-                            input={"node_count": len(nodes), "collection": collection},
-                        )
-                    except Exception:
-                        pass
-
-                extra_contexts = await retriever.resolve_from_nodes(nodes, collection)
-
-                if lf_span:
-                    try:
-                        lf_span.end(output={"extra_context_count": len(extra_contexts)})
-                    except Exception:
-                        pass
-
-            # Format retrieved nodes directly — no LLM synthesis here.
-            # LangGraph orchestrator handles synthesis from this context.
+            # Format nodes with enriched source labels so the detect_cross_references
+            # node LLM can identify the source spec when classifying intra-doc refs.
             if nodes:
-                result = "\n---\n".join(
-                    f"[Source: {n.metadata.get('filename', 'unknown')}]\n{n.get_content()}"
-                    for n in nodes
-                )
+                def _fmt(n) -> str:
+                    meta = n.metadata
+                    parts = []
+                    if meta.get("spec_name"):
+                        parts.append(f"spec={meta['spec_name']}")
+                    if meta.get("section_number"):
+                        parts.append(f"section={meta['section_number']}")
+                    parts.append(f"file={meta.get('filename', 'unknown')}")
+                    return f"[Source: {' | '.join(parts)}]\n{n.get_content()}"
+
+                result = "\n---\n".join(_fmt(n) for n in nodes)
             else:
                 result = "No relevant content found."
 
-            # Append resolved cross-reference context
-            if extra_contexts:
-                result += "\n\n--- Referenced Context ---\n" + "\n\n".join(extra_contexts)
-
             elapsed = time.perf_counter() - start
             RETRIEVAL_LATENCY.labels(tool="llamaindex_query", collection=collection).observe(elapsed)
-            result_count = result.count("[Source:") + result.count("[Cross-ref:")
+            result_count = result.count("[Source:")
             RETRIEVAL_RESULTS.labels(tool="llamaindex_query").observe(result_count)
 
             logger.info(
@@ -239,7 +210,7 @@ def get_llamaindex_tools() -> List:
                 mode=mode,
                 collection=collection,
                 result_length=len(result),
-                cross_ref_count=len(extra_contexts),
+                node_count=len(nodes),
                 latency=round(elapsed, 3),
             )
             return result
@@ -259,11 +230,14 @@ def get_llamaindex_tools() -> List:
           - "see section 3.1.2.3"
           - "refer to spec 'EnlargeWA'"
           - "as defined in 4.2.1"
-          - "(EnlargeWA)" — parenthesized spec name
+          - "(EnlargeWA)" or bare "4.4.1.1" in a Reference table column
 
         Automatically detects and fetches:
           - Intra-document: sections referenced within the same document
           - Inter-document: chunks from referenced specifications/documents
+
+        Spec names are resolved with fuzzy matching — typos like 'enlagreWA'
+        are resolved to the closest stored spec name.
 
         Args:
             chunk_text:  The full text of the chunk containing references.
@@ -276,33 +250,58 @@ def get_llamaindex_tools() -> List:
         start = time.perf_counter()
 
         try:
+            from app.services.llm import get_llm
+
+            # Step 1: LLM-based extraction handles table cells + bare section numbers
+            extractor = LLMCrossReferenceExtractor(get_llm(settings.DEFAULT_LLM_MODEL))
+            cross_ref = await extractor.extract(chunk_text)
+
+            if cross_ref.is_empty():
+                return "No cross-references detected or no matching content found."
+
+            # Derive source spec_name from document_id (filename convention) so that
+            # intra-document section refs point at the right spec.
+            doc_meta = DocumentMetadata.from_filename(document_id)
+            source_spec = doc_meta.spec_name if doc_meta else ""
+
+            targets = []
+            for ref in cross_ref.section_refs:
+                targets.append({
+                    "spec_name": source_spec,
+                    "section_number": ref.section_number,
+                    "query": ref.original_text,
+                })
+            for ref in cross_ref.document_refs:
+                targets.append({
+                    "spec_name": ref.spec_name,
+                    "section_number": None,
+                    "query": ref.original_text,
+                })
+
+            # Step 2: Qdrant fetch with fuzzy spec_name resolution + section fallbacks
             aclient = AsyncQdrantClient(
                 host=settings.QDRANT_HOST,
                 port=settings.QDRANT_PORT,
                 api_key=settings.QDRANT_API_KEY or None,
             )
             retriever = CrossReferenceRetriever(aclient, embed_fn=_embed_query)
-            extra_contexts = await retriever.resolve_from_text(
-                text=chunk_text,
-                document_id=document_id,
-                collection=collection,
-            )
+            contexts = await retriever.resolve_targets(targets, collection)
 
             elapsed = time.perf_counter() - start
             RETRIEVAL_LATENCY.labels(tool="resolve_cross_references", collection=collection).observe(elapsed)
-            RETRIEVAL_RESULTS.labels(tool="resolve_cross_references").observe(len(extra_contexts))
+            RETRIEVAL_RESULTS.labels(tool="resolve_cross_references").observe(len(contexts))
 
-            if not extra_contexts:
-                return "No cross-references detected or no matching content found."
+            if not contexts:
+                return "No matching content found for the detected cross-references."
 
             logger.info(
                 "explicit_cross_references_resolved",
                 collection=collection,
                 document_id=document_id,
-                ref_count=len(extra_contexts),
+                ref_count=len(contexts),
                 latency=round(elapsed, 3),
             )
-            return "\n\n".join(extra_contexts)
+            return "\n\n".join(contexts)
 
         except Exception as exc:
             logger.exception("cross_reference_tool_failed", error=str(exc))

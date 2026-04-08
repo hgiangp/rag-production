@@ -4,10 +4,23 @@ IMPORTANT: Adding a field here requires updating CLAUDE.md Section 4 Rule R14.
 All fields must have defaults to allow partial state updates.
 """
 
-from typing import Annotated, Any, List, Optional, TypedDict
+from typing import Annotated, List, Optional, TypedDict
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
+
+
+class CrossRefTarget(TypedDict, total=False):
+    """A resolved cross-reference target extracted from retrieved chunks.
+
+    Populated by the detect_cross_references graph node; consumed by
+    fetch_cross_ref_context.  All Qdrant queries use spec_name as the primary
+    filter — both intra- and inter-document references flow through the same
+    tiered fetch logic (fuzzy spec_name → section_number → semantic fallback).
+    """
+    spec_name: str           # Qdrant filter — target spec (same doc or different)
+    section_number: str      # narrows to a specific clause; absent = spec-level search
+    query: str               # semantic search query built from surrounding context
 
 
 class Citation(TypedDict):
@@ -57,3 +70,4 @@ class AgentState(TypedDict, total=False):
     self_correction_count: int
     user_id: str                       # propagated from GraphState for tool collection routing
     correlation_id: str                # propagated for Langfuse span linking inside tools
+    cross_ref_targets: List[CrossRefTarget]  # set by detect_cross_references, cleared after fetch
