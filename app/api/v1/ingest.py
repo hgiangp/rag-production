@@ -12,7 +12,7 @@ from app.core.config import settings
 from app.core.limiter import limiter
 from app.core.metrics import INGEST_COUNT, INGEST_LATENCY
 from app.rag.llamaindex.indexer import DocumentInput, LlamaIndexer
-from app.rag.llamaindex.tools import invalidate_engine_cache
+from app.rag.llamaindex.tools import ensure_payload_indexes, invalidate_engine_cache
 from app.schemas.ingest import BatchDeleteResponse, BatchIngestResponse, DeleteDocumentResponse, IngestResponse
 
 logger = structlog.get_logger(__name__)
@@ -230,6 +230,8 @@ async def _run_indexing(
             collection=collection,
         )
         duration = time.perf_counter() - start
+        # Ensure payload indexes exist for cross-reference filtering
+        await ensure_payload_indexes(collection)
         # Invalidate stale engine caches so next query loads fresh nodes
         invalidate_engine_cache(collection)
         INGEST_COUNT.labels(file_type=file_type, status="success").inc()
@@ -252,6 +254,8 @@ async def _run_batch_indexing(
         node_counts = await _indexer.index_documents(documents=documents, collection=collection)
         duration = time.perf_counter() - start
 
+        # Ensure payload indexes exist for cross-reference filtering
+        await ensure_payload_indexes(collection)
         # Invalidate stale engine caches
         invalidate_engine_cache(collection)
 

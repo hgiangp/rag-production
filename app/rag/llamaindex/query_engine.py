@@ -9,7 +9,7 @@ Recursive:   starts from retrieved leaf nodes and follows parent-child relations
   Best for: multi-hop questions that span several document sections.
 """
 
-from typing import Literal
+from typing import List, Literal, Tuple
 
 import structlog
 from llama_index.core import VectorStoreIndex
@@ -71,6 +71,19 @@ class LlamaQueryEngine:
             retriever=retriever,
             node_postprocessors=postprocessors,
         )
+
+    async def retrieve_nodes(self, query_str: str) -> List:
+        """Return raw source nodes (with full metadata) for a query.
+
+        Used by the cross-reference pipeline to access document_id and
+        section_number on each node before formatting the final response.
+        """
+        try:
+            response = await self._engine.aquery(query_str)
+            return list(getattr(response, "source_nodes", []))
+        except Exception as exc:
+            logger.exception("llamaindex_retrieve_failed", mode=self._mode, error=str(exc))
+            return []
 
     async def query(self, query_str: str) -> str:
         """Execute async RAG query and return formatted result with source citations."""

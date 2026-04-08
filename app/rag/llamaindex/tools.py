@@ -16,7 +16,7 @@ Two tools are exposed to the agent:
 
 import time
 from pathlib import Path
-from typing import Annotated, Dict, List, Literal, Tuple
+from typing import Annotated, Dict, List, Literal, Optional, Tuple
 
 import structlog
 from langchain_core.tools import tool
@@ -24,11 +24,13 @@ from langgraph.prebuilt import InjectedState
 from llama_index.core import Settings as LISettings, StorageContext, VectorStoreIndex
 from llama_index.core.storage.docstore import SimpleDocumentStore
 from llama_index.vector_stores.qdrant import QdrantVectorStore
-from qdrant_client import QdrantClient
+from qdrant_client import AsyncQdrantClient, QdrantClient
+from qdrant_client.models import PayloadSchemaType
 
 from app.core.config import settings
 from app.core.metrics import RETRIEVAL_LATENCY, RETRIEVAL_RESULTS
 from app.graph.state import AgentState
+from app.rag.llamaindex.cross_reference import CrossReferenceDetector, CrossReferenceRetriever
 from app.rag.llamaindex.indexer import _collection_name, _docstore_path
 from app.rag.llamaindex.query_engine import LlamaQueryEngine
 
@@ -82,6 +84,37 @@ def invalidate_engine_cache(collection: str) -> None:
         _engines.pop((collection, mode), None)
 
 
+async def ensure_payload_indexes(collection: str) -> None:
+    """Create Qdrant payload indexes for cross-reference filtering.
+
+    Indexes: document_id, spec_name, section_number, model_symbol, language.
+    Safe to call multiple times — ignores already-existing indexes.
+    """
+    aclient = AsyncQdrantClient(
+        host=settings.QDRANT_HOST,
+        port=settings.QDRANT_PORT,
+        api_key=settings.QDRANT_API_KEY or None,
+    )
+    col = _collection_name(collection)
+    fields = {
+        "document_id": PayloadSchemaType.KEYWORD,
+        "spec_name": PayloadSchemaType.KEYWORD,
+        "section_number": PayloadSchemaType.KEYWORD,
+        "model_symbol": PayloadSchemaType.KEYWORD,
+        "language": PayloadSchemaType.KEYWORD,
+    }
+    for field, schema in fields.items():
+        try:
+            await aclient.create_payload_index(
+                collection_name=col,
+                field_name=field,
+                field_schema=schema,
+            )
+        except Exception:
+            pass  # index already exists
+    logger.info("payload_indexes_ensured", collection=col)
+
+
 def get_llamaindex_tools() -> List:
     """Return all LlamaIndex RAG tools."""
 
@@ -116,12 +149,34 @@ def get_llamaindex_tools() -> List:
         start = time.perf_counter()
         try:
             engine = await _get_engine(collection, mode)
+
+            # Retrieve raw nodes so we can inspect metadata (document_id, section_number)
+            # and auto-resolve any cross-references found in their text.
+            nodes = await engine.retrieve_nodes(query)
+
+            # Auto-resolve cross-references transparently — no agent action needed.
+            # Uses document_id from node metadata; loop-safe via visited sets.
+            extra_contexts: List[str] = []
+            detector = CrossReferenceDetector()
+            if any(detector.has_references(getattr(n, "text", "")) for n in nodes):
+                aclient = AsyncQdrantClient(
+                    host=settings.QDRANT_HOST,
+                    port=settings.QDRANT_PORT,
+                    api_key=settings.QDRANT_API_KEY or None,
+                )
+                retriever = CrossReferenceRetriever(aclient)
+                extra_contexts = await retriever.resolve_from_nodes(nodes, collection)
+
+            # Format primary result
             result = await engine.query(query)
+
+            # Append resolved cross-reference context
+            if extra_contexts:
+                result += "\n\n--- Referenced Context ---\n" + "\n\n".join(extra_contexts)
 
             elapsed = time.perf_counter() - start
             RETRIEVAL_LATENCY.labels(tool="llamaindex_query", collection=collection).observe(elapsed)
-            # count non-empty source lines as a proxy for result count
-            result_count = result.count("[Source:")
+            result_count = result.count("[Source:") + result.count("[Cross-ref:")
             RETRIEVAL_RESULTS.labels(tool="llamaindex_query").observe(result_count)
 
             logger.info(
@@ -129,6 +184,7 @@ def get_llamaindex_tools() -> List:
                 mode=mode,
                 collection=collection,
                 result_length=len(result),
+                cross_ref_count=len(extra_contexts),
                 latency=round(elapsed, 3),
             )
             return result
@@ -136,4 +192,65 @@ def get_llamaindex_tools() -> List:
             logger.exception("llamaindex_tool_failed", mode=mode, error=str(exc))
             return f"LLAMAINDEX_ERROR: {str(exc)}"
 
-    return [llamaindex_query]
+    @tool("resolve_cross_references")
+    async def resolve_cross_references(
+        chunk_text: str,
+        document_id: str,
+        state: Annotated[AgentState, InjectedState],
+    ) -> str:
+        """Resolve cross-references found inside a retrieved chunk.
+
+        Use this when a retrieved chunk contains phrases like:
+          - "see section 3.1.2.3"
+          - "refer to spec 'EnlargeWA'"
+          - "as defined in 4.2.1"
+          - "(EnlargeWA)" — parenthesized spec name
+
+        Automatically detects and fetches:
+          - Intra-document: sections referenced within the same document
+          - Inter-document: chunks from referenced specifications/documents
+
+        Args:
+            chunk_text:  The full text of the chunk containing references.
+            document_id: The document_id of the chunk (from its metadata).
+
+        Returns:
+            Resolved context from all detected references, with source labels.
+        """
+        collection = f"docs_{state['user_id']}"
+        start = time.perf_counter()
+
+        try:
+            aclient = AsyncQdrantClient(
+                host=settings.QDRANT_HOST,
+                port=settings.QDRANT_PORT,
+                api_key=settings.QDRANT_API_KEY or None,
+            )
+            retriever = CrossReferenceRetriever(aclient)
+            extra_contexts = await retriever.resolve_from_text(
+                text=chunk_text,
+                document_id=document_id,
+                collection=collection,
+            )
+
+            elapsed = time.perf_counter() - start
+            RETRIEVAL_LATENCY.labels(tool="resolve_cross_references", collection=collection).observe(elapsed)
+            RETRIEVAL_RESULTS.labels(tool="resolve_cross_references").observe(len(extra_contexts))
+
+            if not extra_contexts:
+                return "No cross-references detected or no matching content found."
+
+            logger.info(
+                "explicit_cross_references_resolved",
+                collection=collection,
+                document_id=document_id,
+                ref_count=len(extra_contexts),
+                latency=round(elapsed, 3),
+            )
+            return "\n\n".join(extra_contexts)
+
+        except Exception as exc:
+            logger.exception("cross_reference_tool_failed", error=str(exc))
+            return f"CROSS_REF_ERROR: {str(exc)}"
+
+    return [llamaindex_query, resolve_cross_references]

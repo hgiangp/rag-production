@@ -29,6 +29,7 @@ from qdrant_client import AsyncQdrantClient
 
 from app.core.config import settings
 from app.core.metrics import INGEST_CHUNKS
+from app.rag.llamaindex.cross_reference import enrich_node_metadata
 
 logger = structlog.get_logger(__name__)
 
@@ -323,8 +324,18 @@ def _parse_with_docling(
         else:
             final_nodes.append(node)
 
-    # Ensure all nodes have the document metadata
+    # Enrich all nodes with document metadata + cross-reference support
     for node in final_nodes:
+        # Get heading text for section number extraction
+        heading_text = node.metadata.get("heading", "") or node.metadata.get("Header", "")
+
+        # Enrich metadata with parsed filename (model, spec_name, etc.) and section number
+        node.metadata = enrich_node_metadata(
+            metadata=node.metadata,
+            filename=filename,
+            heading_text=heading_text,
+        )
+        # Ensure required fields are set
         node.metadata["document_id"] = document_id
         node.metadata["filename"] = filename
 
