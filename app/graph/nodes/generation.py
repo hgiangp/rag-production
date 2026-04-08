@@ -15,9 +15,13 @@ logger = structlog.get_logger(__name__)
 _ORCHESTRATOR_SYSTEM = (
     "You are a research assistant with access to document search tools. "
     "To answer the user's question:\n"
-    "1. ALWAYS start by calling search_child_chunks to find relevant passages\n"
-    "2. Then call fetch_parent_chunks to get full context\n"
-    "3. If the retrieved context is insufficient, search again with different keywords\n"
+    "1. ALWAYS start by calling llamaindex_query to find relevant context\n"
+    "   - Use mode='auto_merging' (default) for dense factual questions and table/list lookups\n"
+    "   - Use mode='recursive' for multi-hop questions that span multiple sections\n"
+    "2. If the retrieved context contains phrases like 'see section X', 'refer to spec Y', "
+    "or '(SpecName)' pointing to information NOT already in the context, call "
+    "resolve_cross_references with that chunk's text and document_id to fetch the referenced content\n"
+    "3. If the context is still insufficient, call llamaindex_query again with rephrased keywords\n"
     "4. Once you have enough context, provide a comprehensive answer with source references\n"
     "Never answer from memory alone — always ground answers in retrieved documents."
 )
@@ -50,7 +54,7 @@ async def orchestrator(state: AgentState, llm_with_tools: BaseChatModel) -> dict
 
     if not state.get("messages"):
         question = state.get("question", "")
-        force = HumanMessage(content="Start by calling search_child_chunks to find relevant information.")
+        force = HumanMessage(content="Start by calling llamaindex_query to find relevant information.")
         msgs = [sys_msg] + injection + [HumanMessage(content=question), force]
     else:
         msgs = [sys_msg] + injection + list(state["messages"])
