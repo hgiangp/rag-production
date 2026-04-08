@@ -435,14 +435,14 @@ class CrossReferenceRetriever:
                     None if unresolved
                     else Filter(must=[FieldCondition(key="spec_name", match=MatchValue(value=filter_name))])
                 )
-                sem_results = await self._client.search(
+                response = await self._client.query_points(
                     collection_name=collection,
-                    query_vector=vector,
+                    query=vector,
                     query_filter=q_filter,
                     limit=limit,
                     with_payload=True,
                 )
-                chunks = [r.payload["text"] for r in sem_results if r.payload and "text" in r.payload]
+                chunks = [r.payload["text"] for r in response.points if r.payload and "text" in r.payload]
                 logger.debug(
                     "spec_section_filter_result",
                     spec=filter_name, section=section_number, found=len(chunks), tier=3,
@@ -486,9 +486,9 @@ class CrossReferenceRetriever:
 
             if resolved and query and self._embed:
                 vector = await self._embed(query)
-                results = await self._client.search(
+                response = await self._client.query_points(
                     collection_name=collection,
-                    query_vector=vector,
+                    query=vector,
                     query_filter=Filter(must=[
                         FieldCondition(key="spec_name", match=MatchValue(value=resolved))
                     ]),
@@ -497,7 +497,7 @@ class CrossReferenceRetriever:
                 )
                 chunks = [
                     f"{r.payload['text']}\n[Source: {r.payload.get('filename', '')}]"
-                    for r in results if r.payload and "text" in r.payload
+                    for r in response.points if r.payload and "text" in r.payload
                 ]
                 logger.debug("spec_ref_fetched", spec=resolved, found=len(chunks), method="semantic_resolved")
 
@@ -519,15 +519,15 @@ class CrossReferenceRetriever:
             elif query and self._embed:
                 # Tier 3: spec_name unresolvable — semantic search without filter
                 vector = await self._embed(query)
-                results = await self._client.search(
+                response = await self._client.query_points(
                     collection_name=collection,
-                    query_vector=vector,
+                    query=vector,
                     limit=limit,
                     with_payload=True,
                 )
                 chunks = [
                     f"{r.payload['text']}\n[Source: {r.payload.get('filename', '')}]"
-                    for r in results if r.payload and "text" in r.payload
+                    for r in response.points if r.payload and "text" in r.payload
                 ]
                 logger.debug("spec_ref_fetched", spec=spec_name, found=len(chunks), method="semantic_unfiltered")
 

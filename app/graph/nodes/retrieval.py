@@ -28,16 +28,27 @@ _RAG_TOOL_NAMES = {"llamaindex_query", "llamaindex_recursive", "search_child_chu
 class _CrossRefTargetLLM(BaseModel):
     spec_name: str = PydanticField(
         description=(
-            "Target spec name for the Qdrant filter. "
-            "For intra-document section refs use the source chunk's spec (shown in [Source: spec=...])."
+            "SHORT spec name — never the full filename. "
+            "For intra-document section refs: copy the value from [Source: spec=<name>] exactly. "
+            "For inter-document refs like 'SPEC \"Enlarge WA\"' or '(EnlargeWA)': extract only the name ('Enlarge WA'). "
+            "If no spec= label is present, parse from the filename: '7821_(Pop-up)_E_210617.docx' → 'Pop-up'."
         )
     )
     section_number: Optional[str] = PydanticField(
         None,
-        description="Target section number if the ref points to a specific clause (e.g. '4.4.1.1'); omit otherwise.",
+        description=(
+            "Dotted section number ONLY — e.g. '4.4.1.3', '3.1.2'. "
+            "Set this when the reference points to a specific clause or section. "
+            "Leave null for spec-level references (e.g. 'SPEC \"Enlarge WA\"' with no section)."
+        ),
     )
     query: str = PydanticField(
-        description="Semantic search query describing what the referenced content covers.",
+        description=(
+            "Short human-readable description of what the referenced content covers, "
+            "used as a semantic search query. "
+            "Example: 'display specification of Item Back button', 'scroll bar behavior'. "
+            "Do NOT put section numbers or spec names here."
+        ),
     )
 
 
@@ -46,14 +57,27 @@ class _CrossRefDetectionOutput(BaseModel):
 
 
 _DETECT_SYSTEM = (
-    "You detect cross-references in retrieved document chunks.\n"
-    "A cross-reference is any pointer to content not already shown in the chunks:\n"
-    "  - A section or clause, e.g. '4.4.1.1', 'Section 3.2', '3.1.2.3項'\n"
-    "  - A different specification, e.g. 'EnlargeWA', 'SPEC \"Enlarge WA\"', '(EnlargeWA)'\n"
-    "  - A bare number in a 'Reference' table column — use column headers for context.\n"
-    "For intra-document section refs, set spec_name to the source chunk's spec "
-    "(visible in the [Source: spec=...] label).\n"
-    "Only return references to content that is NOT already present in the chunks above.\n"
+    "Extract cross-references from retrieved document chunks.\n\n"
+    "Each chunk is prefixed with: [Source: spec=<spec_name> | section=<sec> | file=<filename>]\n\n"
+    "FIELD RULES:\n"
+    "  spec_name     Short spec name from the [Source: spec=...] label, or parsed from the\n"
+    "                filename ('7821_(Pop-up)_E_210617.docx' → 'Pop-up').\n"
+    "                For inter-document refs ('SPEC \"Enlarge WA\"'): use the referenced spec name.\n"
+    "                NEVER copy the full filename into spec_name.\n"
+    "  section_number  The dotted number (e.g. '4.4.1.3'). Set only when ref is to a specific\n"
+    "                  clause. Null for spec-level refs.\n"
+    "  query         Brief description of what the reference covers — for semantic search.\n"
+    "                Do NOT put numbers or spec names here.\n\n"
+    "EXAMPLE INPUT (chunk from spec Pop-up):\n"
+    "  [Source: spec=Pop-up | file=781_(Pop-up)_E_210617.docx]\n"
+    "  Table 4-8 Display contents\n"
+    "  | Display Contents | Reference        |\n"
+    "  | Item Back        | 4.4.1.3          |\n"
+    "  | Scroll bar       | SPEC \"Enlarge WA\" |\n\n"
+    "EXAMPLE OUTPUT:\n"
+    "  [{spec_name: 'Pop-up',     section_number: '4.4.1.3', query: 'display spec of Item Back button'},\n"
+    "   {spec_name: 'Enlarge WA', section_number: null,      query: 'display spec of scroll bar'}]\n\n"
+    "Only return references to content NOT already shown in the chunks. "
     "Return an empty list when there are no actionable cross-references."
 )
 

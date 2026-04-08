@@ -189,8 +189,15 @@ def get_llamaindex_tools() -> List:
                 def _fmt(n) -> str:
                     meta = n.metadata
                     parts = []
-                    if meta.get("spec_name"):
-                        parts.append(f"spec={meta['spec_name']}")
+                    spec = meta.get("spec_name") or ""
+                    if not spec and meta.get("filename"):
+                        # Parse from filename convention so the detection LLM always
+                        # sees spec= even when the indexer didn't store spec_name.
+                        # '7821_(Pop-up)_E_210617.docx' → 'Pop-up'
+                        doc_meta = DocumentMetadata.from_filename(meta["filename"])
+                        spec = doc_meta.spec_name if doc_meta else ""
+                    if spec:
+                        parts.append(f"spec={spec}")
                     if meta.get("section_number"):
                         parts.append(f"section={meta['section_number']}")
                     parts.append(f"file={meta.get('filename', 'unknown')}")
