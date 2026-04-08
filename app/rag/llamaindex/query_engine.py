@@ -75,12 +75,12 @@ class LlamaQueryEngine:
     async def retrieve_nodes(self, query_str: str) -> List:
         """Return raw source nodes (with full metadata) for a query.
 
-        Used by the cross-reference pipeline to access document_id and
-        section_number on each node before formatting the final response.
+        Uses the retriever directly (no LLM synthesis) to avoid a double
+        Ollama call when retrieve_nodes() and query() are both invoked.
         """
         try:
-            response = await self._engine.aquery(query_str)
-            return list(getattr(response, "source_nodes", []))
+            nodes = await self._engine.retriever.aretrieve(query_str)
+            return list(nodes)
         except Exception as exc:
             logger.exception("llamaindex_retrieve_failed", mode=self._mode, error=str(exc))
             return []
