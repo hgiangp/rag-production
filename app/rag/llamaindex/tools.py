@@ -26,7 +26,6 @@ from llama_index.core import Settings as LISettings, StorageContext, VectorStore
 from llama_index.core.storage.docstore import SimpleDocumentStore
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from qdrant_client import AsyncQdrantClient, QdrantClient
-from qdrant_client.models import PayloadSchemaType
 
 from app.core.config import settings
 from app.core.metrics import RETRIEVAL_LATENCY, RETRIEVAL_RESULTS
@@ -111,36 +110,6 @@ def invalidate_engine_cache(collection: str) -> None:
     for mode in ("auto_merging", "recursive"):
         _engines.pop((collection, mode), None)
 
-
-async def ensure_payload_indexes(collection: str) -> None:
-    """Create Qdrant payload indexes for cross-reference filtering.
-
-    Indexes: document_id, spec_name, section_number, model_symbol, language.
-    Safe to call multiple times — ignores already-existing indexes.
-    """
-    aclient = AsyncQdrantClient(
-        host=settings.QDRANT_HOST,
-        port=settings.QDRANT_PORT,
-        api_key=settings.QDRANT_API_KEY or None,
-    )
-    col = _collection_name(collection)
-    fields = {
-        "document_id": PayloadSchemaType.KEYWORD,
-        "spec_name": PayloadSchemaType.KEYWORD,
-        "section_number": PayloadSchemaType.KEYWORD,
-        "model_symbol": PayloadSchemaType.KEYWORD,
-        "language": PayloadSchemaType.KEYWORD,
-    }
-    for field, schema in fields.items():
-        try:
-            await aclient.create_payload_index(
-                collection_name=col,
-                field_name=field,
-                field_schema=schema,
-            )
-        except Exception:
-            pass  # index already exists
-    logger.info("payload_indexes_ensured", collection=col)
 
 
 def get_llamaindex_tools() -> List:

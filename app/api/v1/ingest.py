@@ -12,7 +12,8 @@ from app.core.config import settings
 from app.core.limiter import limiter
 from app.core.metrics import INGEST_COUNT, INGEST_LATENCY
 from app.rag.llamaindex.indexer import DocumentInput, LlamaIndexer
-from app.rag.llamaindex.tools import ensure_payload_indexes, invalidate_engine_cache
+from app.rag.llamaindex.cross_reference import ensure_payload_indexes
+from app.rag.llamaindex.tools import invalidate_engine_cache
 from app.schemas.ingest import BatchDeleteResponse, BatchIngestResponse, DeleteDocumentResponse, IngestResponse
 
 logger = structlog.get_logger(__name__)

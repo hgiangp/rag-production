@@ -29,7 +29,11 @@ from qdrant_client import AsyncQdrantClient
 
 from app.core.config import settings
 from app.core.metrics import INGEST_CHUNKS
-from app.rag.llamaindex.cross_reference import enrich_node_metadata
+from app.rag.llamaindex.cross_reference import (
+    enrich_node_metadata,
+    ensure_payload_indexes,
+    invalidate_spec_name_cache,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -103,6 +107,12 @@ class LlamaIndexer:
 
         # Persist docstore (persist expects file path, not directory)
         await loop.run_in_executor(None, docstore.persist, str(docstore_path / "docstore.json"))
+
+        # Ensure Qdrant payload indexes exist for cross-reference filtering fields.
+        # Safe to call repeatedly — ignores already-existing indexes.
+        await ensure_payload_indexes(collection)
+        # Invalidate spec_name cache so next cross-ref resolution fetches fresh names.
+        invalidate_spec_name_cache(collection)
 
         total = len(nodes)
         INGEST_CHUNKS.observe(total)
@@ -182,6 +192,9 @@ class LlamaIndexer:
 
         # Persist docstore once
         await loop.run_in_executor(None, docstore.persist, str(docstore_path / "docstore.json"))
+
+        await ensure_payload_indexes(collection)
+        invalidate_spec_name_cache(collection)
 
         total = len(all_nodes)
         INGEST_CHUNKS.observe(total)
@@ -326,8 +339,17 @@ def _parse_with_docling(
 
     # Enrich all nodes with document metadata + cross-reference support
     for node in final_nodes:
-        # Get heading text for section number extraction
-        heading_text = node.metadata.get("heading", "") or node.metadata.get("Header", "")
+        # MarkdownNodeParser stores headers as 'Header_1', 'Header_2', 'Header_3'.
+        # DoclingNodeParser uses 'heading'. Fall back through all known keys so
+        # section_number extraction works regardless of parser mode.
+        heading_text = (
+            node.metadata.get("heading")
+            or node.metadata.get("Header_1")
+            or node.metadata.get("Header_2")
+            or node.metadata.get("Header_3")
+            or node.metadata.get("Header")
+            or ""
+        )
 
         # Enrich metadata with parsed filename (model, spec_name, etc.) and section number
         node.metadata = enrich_node_metadata(

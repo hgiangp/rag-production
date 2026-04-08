@@ -292,6 +292,40 @@ def invalidate_spec_name_cache(collection: str = "") -> None:
         _spec_name_cache.clear()
 
 
+async def ensure_payload_indexes(collection: str) -> None:
+    """Create Qdrant payload indexes for cross-reference filtering fields.
+
+    Indexes: document_id, spec_name, section_number, model_symbol, language.
+    Safe to call repeatedly — ignores already-existing indexes.
+    Called by the indexer after every document ingestion.
+    """
+    from qdrant_client.models import PayloadSchemaType
+
+    aclient = AsyncQdrantClient(
+        host=settings.QDRANT_HOST,
+        port=settings.QDRANT_PORT,
+        api_key=settings.QDRANT_API_KEY or None,
+    )
+    col = _llama_collection(collection)
+    fields = {
+        "document_id": PayloadSchemaType.KEYWORD,
+        "spec_name": PayloadSchemaType.KEYWORD,
+        "section_number": PayloadSchemaType.KEYWORD,
+        "model_symbol": PayloadSchemaType.KEYWORD,
+        "language": PayloadSchemaType.KEYWORD,
+    }
+    for field, schema in fields.items():
+        try:
+            await aclient.create_payload_index(
+                collection_name=col,
+                field_name=field,
+                field_schema=schema,
+            )
+        except Exception:
+            pass  # index already exists
+    logger.info("payload_indexes_ensured", collection=col)
+
+
 class CrossReferenceRetriever:
     """Resolves structured CrossRefTarget dicts via Qdrant payload filters + semantic search.
 
