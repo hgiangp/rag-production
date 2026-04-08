@@ -19,6 +19,14 @@ class Citation(BaseModel):
     excerpt: str = Field(description="Short excerpt from the source chunk")
 
 
+class RetrievedChunk(BaseModel):
+    """A single retrieved chunk shown to the user during streaming."""
+    source: str = Field(description="Source filename")
+    content: str = Field(description="Full chunk content")
+    score: Optional[float] = Field(None, ge=0.0, le=1.0, description="Relevance score if available")
+    tool: str = Field(description="Tool that retrieved this chunk")
+
+
 class TriadScores(BaseModel):
     context_relevance: Optional[float] = Field(None, ge=0.0, le=1.0)
     groundedness: Optional[float] = Field(None, ge=0.0, le=1.0)
@@ -43,10 +51,20 @@ class ChatResponse(BaseModel):
 
 
 class StreamChunk(BaseModel):
-    """Single SSE chunk in streaming responses."""
-    type: Literal["token", "citation", "done", "error"]
+    """Single SSE chunk in streaming responses.
+
+    Types:
+      token           — LLM answer token
+      progress        — pipeline step status (rewrite, retrieve, synthesize)
+      retrieved_chunk — chunks returned by a retrieval tool
+      citation        — final source citations after generation
+      done            — stream completed
+      error           — unrecoverable error
+    """
+    type: Literal["token", "progress", "retrieved_chunk", "citation", "done", "error"]
     content: str = ""
     citations: Optional[List[Citation]] = None
+    retrieved_chunks: Optional[List[RetrievedChunk]] = None
     error: Optional[str] = None
 
 
