@@ -461,36 +461,46 @@ class CrossReferenceRetriever:
         """
         dense_vector = await self._embed(query_text)
         if self._sparse_embed:
-            sparse_vector = await self._sparse_embed(query_text)
-            response = await self._client.query_points(
-                collection_name=collection,
-                prefetch=[
-                    Prefetch(
-                        query=dense_vector,
-                        using=_DENSE_VECTOR_NAME,
-                        filter=query_filter,
-                        limit=limit * 2,
-                    ),
-                    Prefetch(
-                        query=sparse_vector,
-                        using=_SPARSE_VECTOR_NAME,
-                        filter=query_filter,
-                        limit=limit * 2,
-                    ),
-                ],
-                query=FusionQuery(fusion=Fusion.RRF),
-                limit=limit,
-                with_payload=True,
-            )
-        else:
-            response = await self._client.query_points(
-                collection_name=collection,
-                query=dense_vector,
-                using=_DENSE_VECTOR_NAME,
-                query_filter=query_filter,
-                limit=limit,
-                with_payload=True,
-            )
+            try:
+                sparse_vector = await self._sparse_embed(query_text)
+                response = await self._client.query_points(
+                    collection_name=collection,
+                    prefetch=[
+                        Prefetch(
+                            query=dense_vector,
+                            using=_DENSE_VECTOR_NAME,
+                            filter=query_filter,
+                            limit=limit * 2,
+                        ),
+                        Prefetch(
+                            query=sparse_vector,
+                            using=_SPARSE_VECTOR_NAME,
+                            filter=query_filter,
+                            limit=limit * 2,
+                        ),
+                    ],
+                    query=FusionQuery(fusion=Fusion.RRF),
+                    limit=limit,
+                    with_payload=True,
+                )
+                return response.points
+            except Exception as exc:
+                if "Not existing vector name" not in str(exc):
+                    raise
+                # Collection was indexed without sparse vectors — fall through to dense-only
+                logger.debug(
+                    "hybrid_query_no_sparse_vector",
+                    collection=collection,
+                    hint="re-index to enable BM25 hybrid search",
+                )
+        response = await self._client.query_points(
+            collection_name=collection,
+            query=dense_vector,
+            using=_DENSE_VECTOR_NAME,
+            query_filter=query_filter,
+            limit=limit,
+            with_payload=True,
+        )
         return response.points
 
     async def _fetch_by_spec_section(

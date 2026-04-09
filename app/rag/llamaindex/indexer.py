@@ -188,6 +188,8 @@ class LlamaIndexer:
         vector_store = QdrantVectorStore(
             aclient=self._aclient,
             collection_name=_collection_name(collection),
+            enable_hybrid=True,
+            fastembed_sparse_model="Qdrant/bm25",
         )
         storage_ctx = StorageContext.from_defaults(vector_store=vector_store, docstore=docstore)
         index = VectorStoreIndex([], storage_context=storage_ctx, show_progress=False)
