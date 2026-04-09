@@ -288,7 +288,7 @@ class CrossReferenceDetector:
 # Populated on first resolution per collection; call invalidate_spec_name_cache() after re-indexing.
 # Named vectors used by LlamaIndex QdrantVectorStore (enable_hybrid=True defaults)
 _DENSE_VECTOR_NAME = "text-dense"
-_SPARSE_VECTOR_NAME = "text-sparse"
+_SPARSE_VECTOR_NAME = "text-sparse-new"
 
 _spec_name_cache: Dict[str, List[str]] = {}
 
