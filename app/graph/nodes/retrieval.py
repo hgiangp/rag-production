@@ -180,14 +180,14 @@ async def fetch_cross_ref_context(state: AgentState) -> dict:
     collection = f"docs_{state['user_id']}"
 
     try:
-        from app.rag.llamaindex.tools import _embed_query, _sparse_embed_query
+        from app.rag.llamaindex.tools import _embed_query
 
         aclient = AsyncQdrantClient(
             host=settings.QDRANT_HOST,
             port=settings.QDRANT_PORT,
             api_key=settings.QDRANT_API_KEY or None,
         )
-        retriever = CrossReferenceRetriever(aclient, embed_fn=_embed_query, sparse_embed_fn=_sparse_embed_query)
+        retriever = CrossReferenceRetriever(aclient, embed_fn=_embed_query)
         contexts = await retriever.resolve_targets(list(targets), collection)
     except Exception as exc:
         logger.exception("fetch_cross_ref_context_failed", error=str(exc))

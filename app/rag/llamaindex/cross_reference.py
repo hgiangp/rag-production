@@ -37,7 +37,14 @@ import structlog
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field as PydanticField
 from qdrant_client import AsyncQdrantClient
-from qdrant_client.models import FieldCondition, Filter, Fusion, FusionQuery, MatchValue, Prefetch
+from qdrant_client.models import FieldCondition, Filter, MatchValue
+from llama_index.core.vector_stores.types import (
+    MetadataFilter,
+    MetadataFilters,
+    VectorStoreQuery,
+    VectorStoreQueryMode,
+)
+from llama_index.vector_stores.qdrant import QdrantVectorStore
 
 from app.core.config import settings
 
@@ -286,10 +293,6 @@ class CrossReferenceDetector:
 
 # Module-level spec_name cache: collection (with __llama suffix) → distinct stored spec_names.
 # Populated on first resolution per collection; call invalidate_spec_name_cache() after re-indexing.
-# Named vectors used by LlamaIndex QdrantVectorStore (enable_hybrid=True defaults)
-_DENSE_VECTOR_NAME = "text-dense"
-_SPARSE_VECTOR_NAME = "text-sparse-new"
-
 _spec_name_cache: Dict[str, List[str]] = {}
 
 
@@ -368,11 +371,25 @@ class CrossReferenceRetriever:
         self,
         qdrant_client: AsyncQdrantClient,
         embed_fn: Optional[Callable[[str], Awaitable[List[float]]]] = None,
-        sparse_embed_fn: Optional[Callable] = None,
     ) -> None:
         self._client = qdrant_client
         self._embed = embed_fn
-        self._sparse_embed = sparse_embed_fn
+        self._vs_cache: Dict[str, QdrantVectorStore] = {}
+
+    def _get_vector_store(self, collection: str) -> QdrantVectorStore:
+        """Return a cached QdrantVectorStore for a collection.
+
+        enable_hybrid=True lets LlamaIndex handle dense+sparse vector naming
+        and RRF fusion internally — no hardcoded vector names needed.
+        """
+        if collection not in self._vs_cache:
+            self._vs_cache[collection] = QdrantVectorStore(
+                aclient=self._client,
+                collection_name=collection,
+                enable_hybrid=True,
+                fastembed_sparse_model="Qdrant/bm25",
+            )
+        return self._vs_cache[collection]
 
     async def resolve_targets(
         self,
@@ -451,57 +468,47 @@ class CrossReferenceRetriever:
         self,
         collection: str,
         query_text: str,
-        query_filter=None,
+        spec_name_filter: Optional[str] = None,
         limit: int = 3,
     ):
-        """Hybrid dense+BM25 query with RRF, or dense-only if no sparse embed fn.
+        """Hybrid dense+BM25 query via LlamaIndex QdrantVectorStore.aquery().
 
-        Returns the raw list of ScoredPoint objects so callers can format payload
-        themselves (some callers include [Source: filename], others do not).
+        LlamaIndex handles vector naming, sparse generation (fastembed), and RRF
+        fusion internally — no hardcoded vector names. Falls back to dense-only
+        when the collection was indexed without sparse vectors.
+
+        Returns a list of LlamaIndex BaseNode objects.
         """
         dense_vector = await self._embed(query_text)
-        if self._sparse_embed:
-            try:
-                sparse_vector = await self._sparse_embed(query_text)
-                response = await self._client.query_points(
-                    collection_name=collection,
-                    prefetch=[
-                        Prefetch(
-                            query=dense_vector,
-                            using=_DENSE_VECTOR_NAME,
-                            filter=query_filter,
-                            limit=limit * 2,
-                        ),
-                        Prefetch(
-                            query=sparse_vector,
-                            using=_SPARSE_VECTOR_NAME,
-                            filter=query_filter,
-                            limit=limit * 2,
-                        ),
-                    ],
-                    query=FusionQuery(fusion=Fusion.RRF),
-                    limit=limit,
-                    with_payload=True,
-                )
-                return response.points
-            except Exception as exc:
-                if "Not existing vector name" not in str(exc):
-                    raise
-                # Collection was indexed without sparse vectors — fall through to dense-only
-                logger.debug(
-                    "hybrid_query_no_sparse_vector",
-                    collection=collection,
-                    hint="re-index to enable BM25 hybrid search",
-                )
-        response = await self._client.query_points(
-            collection_name=collection,
-            query=dense_vector,
-            using=_DENSE_VECTOR_NAME,
-            query_filter=query_filter,
-            limit=limit,
-            with_payload=True,
+        filters = (
+            MetadataFilters(filters=[MetadataFilter(key="spec_name", value=spec_name_filter)])
+            if spec_name_filter else None
         )
-        return response.points
+        vs = self._get_vector_store(collection)
+        try:
+            result = await vs.aquery(VectorStoreQuery(
+                query_embedding=dense_vector,
+                query_str=query_text,
+                similarity_top_k=limit,
+                mode=VectorStoreQueryMode.HYBRID,
+                filters=filters,
+            ))
+            return result.nodes or []
+        except Exception as exc:
+            if "Not existing vector name" not in str(exc):
+                raise
+            logger.debug(
+                "hybrid_query_no_sparse_vector",
+                collection=collection,
+                hint="re-index to enable BM25 hybrid search",
+            )
+            result = await vs.aquery(VectorStoreQuery(
+                query_embedding=dense_vector,
+                similarity_top_k=limit,
+                mode=VectorStoreQueryMode.DEFAULT,
+                filters=filters,
+            ))
+            return result.nodes or []
 
     async def _fetch_by_spec_section(
         self,
@@ -541,12 +548,12 @@ class CrossReferenceRetriever:
 
             # Tier 3: semantic within spec (section tag may be wrong)
             if not chunks and query and self._embed:
-                q_filter = (
-                    None if unresolved
-                    else Filter(must=[FieldCondition(key="spec_name", match=MatchValue(value=filter_name))])
+                nodes = await self._query(
+                    collection, query,
+                    spec_name_filter=None if unresolved else filter_name,
+                    limit=limit,
                 )
-                points = await self._query(collection, query, query_filter=q_filter, limit=limit)
-                chunks = [r.payload["text"] for r in points if r.payload and "text" in r.payload]
+                chunks = [n.get_content() for n in nodes]
                 logger.debug(
                     "spec_section_filter_result",
                     spec=filter_name, section=section_number, found=len(chunks), tier=3,
@@ -589,15 +596,10 @@ class CrossReferenceRetriever:
             resolved = await self._resolve_spec_name(collection, spec_name)
 
             if resolved and query and self._embed:
-                points = await self._query(
-                    collection,
-                    query,
-                    query_filter=Filter(must=[FieldCondition(key="spec_name", match=MatchValue(value=resolved))]),
-                    limit=limit,
-                )
+                nodes = await self._query(collection, query, spec_name_filter=resolved, limit=limit)
                 chunks = [
-                    f"{r.payload['text']}\n[Source: {r.payload.get('filename', '')}]"
-                    for r in points if r.payload and "text" in r.payload
+                    f"{n.get_content()}\n[Source: {n.metadata.get('filename', '')}]"
+                    for n in nodes
                 ]
                 logger.debug("spec_ref_fetched", spec=resolved, found=len(chunks), method="semantic_resolved")
 
@@ -618,10 +620,10 @@ class CrossReferenceRetriever:
 
             elif query and self._embed:
                 # Tier 3: spec_name unresolvable — semantic search without filter
-                points = await self._query(collection, query, limit=limit)
+                nodes = await self._query(collection, query, limit=limit)
                 chunks = [
-                    f"{r.payload['text']}\n[Source: {r.payload.get('filename', '')}]"
-                    for r in points if r.payload and "text" in r.payload
+                    f"{n.get_content()}\n[Source: {n.metadata.get('filename', '')}]"
+                    for n in nodes
                 ]
                 logger.debug("spec_ref_fetched", spec=spec_name, found=len(chunks), method="semantic_unfiltered")
 

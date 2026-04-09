@@ -68,33 +68,6 @@ async def _embed_query(text: str) -> List[float]:
     return await loop.run_in_executor(None, embedding_service.model.embed_query, text)
 
 
-_sparse_bm25_model = None
-
-
-async def _sparse_embed_query(text: str):
-    """Generate a BM25 sparse vector via fastembed (same model used at index time).
-
-    Returns a qdrant_client SparseVector suitable for passing directly to Prefetch.query.
-    The model is lazy-initialized and reused across calls.
-    """
-    from fastembed import SparseTextEmbedding
-    from qdrant_client.models import SparseVector
-
-    global _sparse_bm25_model
-    loop = asyncio.get_event_loop()
-
-    def _run():
-        global _sparse_bm25_model
-        if _sparse_bm25_model is None:
-            _sparse_bm25_model = SparseTextEmbedding("Qdrant/bm25")
-        result = next(iter(_sparse_bm25_model.embed([text])))
-        return SparseVector(
-            indices=result.indices.tolist(),
-            values=result.values.tolist(),
-        )
-
-    return await loop.run_in_executor(None, _run)
-
 
 async def _get_engine(collection: str, mode: Literal["auto_merging", "recursive"]) -> LlamaQueryEngine:
     """Lazy-init a LlamaQueryEngine per (collection, mode). Loads docstore from disk."""
@@ -288,7 +261,7 @@ def get_llamaindex_tools() -> List:
                 port=settings.QDRANT_PORT,
                 api_key=settings.QDRANT_API_KEY or None,
             )
-            retriever = CrossReferenceRetriever(aclient, embed_fn=_embed_query, sparse_embed_fn=_sparse_embed_query)
+            retriever = CrossReferenceRetriever(aclient, embed_fn=_embed_query)
             contexts = await retriever.resolve_targets(targets, collection)
 
             elapsed = time.perf_counter() - start
