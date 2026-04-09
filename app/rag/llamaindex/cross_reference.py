@@ -37,7 +37,7 @@ import structlog
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field as PydanticField
 from qdrant_client import AsyncQdrantClient
-from qdrant_client.models import FieldCondition, Filter, MatchValue
+from qdrant_client.models import FieldCondition, Filter, Fusion, FusionQuery, MatchValue, Prefetch
 
 from app.core.config import settings
 
@@ -286,6 +286,10 @@ class CrossReferenceDetector:
 
 # Module-level spec_name cache: collection (with __llama suffix) → distinct stored spec_names.
 # Populated on first resolution per collection; call invalidate_spec_name_cache() after re-indexing.
+# Named vectors used by LlamaIndex QdrantVectorStore (enable_hybrid=True defaults)
+_DENSE_VECTOR_NAME = "text-dense"
+_SPARSE_VECTOR_NAME = "text-sparse"
+
 _spec_name_cache: Dict[str, List[str]] = {}
 
 
@@ -364,9 +368,11 @@ class CrossReferenceRetriever:
         self,
         qdrant_client: AsyncQdrantClient,
         embed_fn: Optional[Callable[[str], Awaitable[List[float]]]] = None,
+        sparse_embed_fn: Optional[Callable] = None,
     ) -> None:
         self._client = qdrant_client
         self._embed = embed_fn
+        self._sparse_embed = sparse_embed_fn
 
     async def resolve_targets(
         self,
@@ -441,6 +447,52 @@ class CrossReferenceRetriever:
 
     # ── Qdrant helpers ────────────────────────────────────────────────────────
 
+    async def _query(
+        self,
+        collection: str,
+        query_text: str,
+        query_filter=None,
+        limit: int = 3,
+    ):
+        """Hybrid dense+BM25 query with RRF, or dense-only if no sparse embed fn.
+
+        Returns the raw list of ScoredPoint objects so callers can format payload
+        themselves (some callers include [Source: filename], others do not).
+        """
+        dense_vector = await self._embed(query_text)
+        if self._sparse_embed:
+            sparse_vector = await self._sparse_embed(query_text)
+            response = await self._client.query_points(
+                collection_name=collection,
+                prefetch=[
+                    Prefetch(
+                        query=dense_vector,
+                        using=_DENSE_VECTOR_NAME,
+                        filter=query_filter,
+                        limit=limit * 2,
+                    ),
+                    Prefetch(
+                        query=sparse_vector,
+                        using=_SPARSE_VECTOR_NAME,
+                        filter=query_filter,
+                        limit=limit * 2,
+                    ),
+                ],
+                query=FusionQuery(fusion=Fusion.RRF),
+                limit=limit,
+                with_payload=True,
+            )
+        else:
+            response = await self._client.query_points(
+                collection_name=collection,
+                query=dense_vector,
+                using=_DENSE_VECTOR_NAME,
+                query_filter=query_filter,
+                limit=limit,
+                with_payload=True,
+            )
+        return response.points
+
     async def _fetch_by_spec_section(
         self,
         collection: str,
@@ -479,19 +531,12 @@ class CrossReferenceRetriever:
 
             # Tier 3: semantic within spec (section tag may be wrong)
             if not chunks and query and self._embed:
-                vector = await self._embed(query)
                 q_filter = (
                     None if unresolved
                     else Filter(must=[FieldCondition(key="spec_name", match=MatchValue(value=filter_name))])
                 )
-                response = await self._client.query_points(
-                    collection_name=collection,
-                    query=vector,
-                    query_filter=q_filter,
-                    limit=limit,
-                    with_payload=True,
-                )
-                chunks = [r.payload["text"] for r in response.points if r.payload and "text" in r.payload]
+                points = await self._query(collection, query, query_filter=q_filter, limit=limit)
+                chunks = [r.payload["text"] for r in points if r.payload and "text" in r.payload]
                 logger.debug(
                     "spec_section_filter_result",
                     spec=filter_name, section=section_number, found=len(chunks), tier=3,
@@ -534,19 +579,15 @@ class CrossReferenceRetriever:
             resolved = await self._resolve_spec_name(collection, spec_name)
 
             if resolved and query and self._embed:
-                vector = await self._embed(query)
-                response = await self._client.query_points(
-                    collection_name=collection,
-                    query=vector,
-                    query_filter=Filter(must=[
-                        FieldCondition(key="spec_name", match=MatchValue(value=resolved))
-                    ]),
+                points = await self._query(
+                    collection,
+                    query,
+                    query_filter=Filter(must=[FieldCondition(key="spec_name", match=MatchValue(value=resolved))]),
                     limit=limit,
-                    with_payload=True,
                 )
                 chunks = [
                     f"{r.payload['text']}\n[Source: {r.payload.get('filename', '')}]"
-                    for r in response.points if r.payload and "text" in r.payload
+                    for r in points if r.payload and "text" in r.payload
                 ]
                 logger.debug("spec_ref_fetched", spec=resolved, found=len(chunks), method="semantic_resolved")
 
@@ -567,16 +608,10 @@ class CrossReferenceRetriever:
 
             elif query and self._embed:
                 # Tier 3: spec_name unresolvable — semantic search without filter
-                vector = await self._embed(query)
-                response = await self._client.query_points(
-                    collection_name=collection,
-                    query=vector,
-                    limit=limit,
-                    with_payload=True,
-                )
+                points = await self._query(collection, query, limit=limit)
                 chunks = [
                     f"{r.payload['text']}\n[Source: {r.payload.get('filename', '')}]"
-                    for r in response.points if r.payload and "text" in r.payload
+                    for r in points if r.payload and "text" in r.payload
                 ]
                 logger.debug("spec_ref_fetched", spec=spec_name, found=len(chunks), method="semantic_unfiltered")
 
