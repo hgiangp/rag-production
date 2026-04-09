@@ -136,24 +136,39 @@ class DocumentMetadata:
 
     @classmethod
     def from_filename(cls, filename: str) -> Optional["DocumentMetadata"]:
-        """Parse '781_(EnlargeWA)_E_250117.docx' → DocumentMetadata."""
+        """
+        Parses filenames like:
+        - '7821ZXXXXQ000_E_Pop-up_210617.docx'
+        - '7821ZXXXXQ000_E_(Pop-up)_210617.docx'
+        """
+        # Remove extension
         name = filename.rsplit(".", 1)[0] if "." in filename else filename
-        patterns = [
-            r"^(\d+)_\(([^)]+)\)_([EJ])_(\d{6})$",   # 781_(EnlargeWA)_E_250117
-            r"^(\d+)_([^_]+)_([EJ])_(\d{6})$",        # 781_EnlargeWA_E_250117
-            r"^(.+?)_([^_]+)_([EJ])_(\d{6})$",        # anything_Spec_E_250117
-        ]
-        for pattern in patterns:
-            m = re.match(pattern, name)
-            if m:
-                return cls(
-                    model_symbol=m.group(1),
-                    spec_name=m.group(2),
-                    language=m.group(3),
-                    version=m.group(4),
-                    raw_filename=filename,
-                )
-        logger.debug("filename_parse_failed", filename=filename)
+        
+        # Regex Breakdown:
+        # ^(.+?)     -> Group 1: Model (Non-greedy match until the first underscore)
+        # _([EJ])_   -> Group 2: Language (Matches E or J)
+        # (.+)       -> Group 3: Spec Name (Matches everything until the last underscore)
+        # _(\d{6})$  -> Group 4: Date (Exactly 6 digits at the end)
+        pattern = r"^(.+?)_([EJ])_(.+)_(\d{6})$"
+        
+        match = re.match(pattern, name)
+        
+        if match:
+            # Clean the spec_name by stripping parentheses if they exist
+            raw_spec = match.group(3)
+            clean_spec = raw_spec.strip("()")
+            
+            logger.debug(f"Successfully parsed: {filename} -> Spec: {clean_spec}")
+            
+            return cls(
+                model_symbol=match.group(1),
+                language=match.group(2),
+                spec_name=clean_spec,
+                version=match.group(4),
+                raw_filename=filename,
+            )
+            
+        logger.warning(f"Failed to parse filename: {filename}")
         return None
 
 
@@ -652,27 +667,6 @@ def extract_section_number(text: str) -> Optional[str]:
         if m:
             return m.group(1)
     return None
-
-
-def enrich_node_metadata(
-    metadata: Dict,
-    filename: str,
-    heading_text: Optional[str] = None,
-) -> Dict:
-    """Add parsed filename fields and section_number to node metadata."""
-    enriched = metadata.copy()
-    doc_meta = DocumentMetadata.from_filename(filename)
-    if doc_meta:
-        enriched["model_symbol"] = doc_meta.model_symbol
-        enriched["spec_name"] = doc_meta.spec_name
-        enriched["language"] = doc_meta.language
-        enriched["version"] = doc_meta.version
-    if heading_text:
-        sec = extract_section_number(heading_text)
-        if sec:
-            enriched["section_number"] = sec
-    return enriched
-
 
 def _llama_collection(collection: str) -> str:
     """Qdrant collection name for the LlamaIndex side."""

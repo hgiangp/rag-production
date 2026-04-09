@@ -26,11 +26,11 @@ from llama_index.node_parser.docling import DoclingNodeParser
 from llama_index.readers.docling import DoclingReader
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from qdrant_client import AsyncQdrantClient
+from app.rag.llamaindex.cross_reference import DocumentMetadata
 
 from app.core.config import settings
 from app.core.metrics import INGEST_CHUNKS
 from app.rag.llamaindex.cross_reference import (
-    enrich_node_metadata,
     ensure_payload_indexes,
     invalidate_spec_name_cache,
 )
@@ -100,7 +100,10 @@ class LlamaIndexer:
         vector_store = QdrantVectorStore(
             aclient=self._aclient,
             collection_name=_collection_name(collection),
+            enable_hybrid=True,
+            fastembed_sparse_model="Qdrant/bm25"
         )
+        
         storage_ctx = StorageContext.from_defaults(vector_store=vector_store, docstore=docstore)
         index = VectorStoreIndex([], storage_context=storage_ctx, show_progress=False)
         await index.ainsert_nodes(nodes)
@@ -110,9 +113,9 @@ class LlamaIndexer:
 
         # Ensure Qdrant payload indexes exist for cross-reference filtering fields.
         # Safe to call repeatedly — ignores already-existing indexes.
-        await ensure_payload_indexes(collection)
+        # await ensure_payload_indexes(collection)
         # Invalidate spec_name cache so next cross-ref resolution fetches fresh names.
-        invalidate_spec_name_cache(collection)
+        # invalidate_spec_name_cache(collection)
 
         total = len(nodes)
         INGEST_CHUNKS.observe(total)
@@ -292,6 +295,20 @@ def _build_nodes(
 
     return nodes
 
+def _extract_document_metadata(filename: str) -> Dict: 
+    """Add parsed filename fields metadata."""
+
+    doc_meta = DocumentMetadata.from_filename(filename)
+    enriched = {}
+
+    enriched["filename"] = filename
+    if doc_meta:
+        enriched["model_symbol"] = doc_meta.model_symbol
+        enriched["spec_name"] = doc_meta.spec_name
+        enriched["language"] = doc_meta.language
+        enriched["version"] = doc_meta.version
+    logger.debug("document_metadata_extracted", filename=filename, metadata=enriched)
+    return enriched
 
 def _parse_with_docling(
     file_path: str,
@@ -300,6 +317,8 @@ def _parse_with_docling(
 ) -> List[BaseNode]:
     """Use DoclingReader with configured parser mode."""
     mode = settings.LLAMAINDEX_PARSER_MODE.lower()
+    
+    doc_meta = _extract_document_metadata(filename)
 
     if mode == "docling":
         # JSON export + DoclingNodeParser (richer grounding)
@@ -317,8 +336,7 @@ def _parse_with_docling(
 
     # Add metadata to documents before parsing
     for doc in documents:
-        doc.metadata["document_id"] = document_id
-        doc.metadata["filename"] = filename
+        doc.metadata.update(doc_meta)
 
     # Parse into nodes
     nodes = node_parser.get_nodes_from_documents(documents)
@@ -336,30 +354,6 @@ def _parse_with_docling(
             final_nodes.extend(split_nodes)
         else:
             final_nodes.append(node)
-
-    # Enrich all nodes with document metadata + cross-reference support
-    for node in final_nodes:
-        # MarkdownNodeParser stores headers as 'Header_1', 'Header_2', 'Header_3'.
-        # DoclingNodeParser uses 'heading'. Fall back through all known keys so
-        # section_number extraction works regardless of parser mode.
-        heading_text = (
-            node.metadata.get("heading")
-            or node.metadata.get("Header_1")
-            or node.metadata.get("Header_2")
-            or node.metadata.get("Header_3")
-            or node.metadata.get("Header")
-            or ""
-        )
-
-        # Enrich metadata with parsed filename (model, spec_name, etc.) and section number
-        node.metadata = enrich_node_metadata(
-            metadata=node.metadata,
-            filename=filename,
-            heading_text=heading_text,
-        )
-        # Ensure required fields are set
-        node.metadata["document_id"] = document_id
-        node.metadata["filename"] = filename
 
     logger.info(
         "document_parsed",

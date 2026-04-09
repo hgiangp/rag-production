@@ -5,7 +5,6 @@ import pytest
 from app.rag.llamaindex.cross_reference import (
     CrossReferenceDetector,
     DocumentMetadata,
-    enrich_node_metadata,
     extract_section_number,
 )
 
@@ -14,31 +13,32 @@ from app.rag.llamaindex.cross_reference import (
 
 class TestDocumentMetadata:
     def test_parses_standard_filename(self):
-        meta = DocumentMetadata.from_filename("781_(EnlargeWA)_E_250117.docx")
+        meta = DocumentMetadata.from_filename("7821ZXXXXQ000_E_(Pop-up)_210617.pdf")
         assert meta is not None
-        assert meta.model_symbol == "781"
-        assert meta.spec_name == "EnlargeWA"
+        assert meta.model_symbol == "7821ZXXXXQ000"
+        assert meta.spec_name == "Pop-up"
         assert meta.language == "E"
-        assert meta.version == "250117"
+        assert meta.version == "210617"
+        assert meta.raw_filename == "7821ZXXXXQ000_E_(Pop-up)_210617.pdf"
 
     def test_parses_japanese_version(self):
-        meta = DocumentMetadata.from_filename("781_(EnlargeWA)_J_250117.docx")
+        meta = DocumentMetadata.from_filename("7821ZXXXXQ000_J_(Pop-up)_210617.pdf")
         assert meta is not None
         assert meta.language == "J"
 
     def test_parses_without_parentheses(self):
-        meta = DocumentMetadata.from_filename("781_EnlargeWA_E_250117.docx")
+        meta = DocumentMetadata.from_filename("7821ZXXXXQ000_E_Pop-up_210617.pdf")
         assert meta is not None
-        assert meta.spec_name == "EnlargeWA"
+        assert meta.spec_name == "Pop-up"
 
     def test_returns_none_for_unknown_format(self):
         meta = DocumentMetadata.from_filename("random_document.docx")
-        assert meta is None
+        assert meta.spec_name is None
 
     def test_handles_no_extension(self):
-        meta = DocumentMetadata.from_filename("781_(EnlargeWA)_E_250117")
+        meta = DocumentMetadata.from_filename("7821ZXXXXQ000_E_Pop-up_210617")
         assert meta is not None
-        assert meta.spec_name == "EnlargeWA"
+        assert meta.spec_name == "Pop-up"
 
 
 # ── extract_section_number ──────────────────────────────────────────────────────
@@ -110,40 +110,3 @@ class TestCrossReferenceDetector:
         assert refs.section_refs == []
         assert refs.document_refs == []
 
-
-# ── enrich_node_metadata ────────────────────────────────────────────────────────
-
-class TestEnrichNodeMetadata:
-    def test_enriches_with_filename_metadata(self):
-        result = enrich_node_metadata(
-            metadata={"document_id": "d1"},
-            filename="781_(EnlargeWA)_E_250117.docx",
-        )
-        assert result["model_symbol"] == "781"
-        assert result["spec_name"] == "EnlargeWA"
-        assert result["language"] == "E"
-        assert result["version"] == "250117"
-        assert result["document_id"] == "d1"  # existing keys preserved
-
-    def test_enriches_with_section_number(self):
-        result = enrich_node_metadata(
-            metadata={},
-            filename="781_(EnlargeWA)_E_250117.docx",
-            heading_text="3.1.2 Overview",
-        )
-        assert result["section_number"] == "3.1.2"
-
-    def test_no_section_when_no_heading(self):
-        result = enrich_node_metadata(
-            metadata={},
-            filename="781_(EnlargeWA)_E_250117.docx",
-        )
-        assert "section_number" not in result
-
-    def test_unparseable_filename_skips_doc_fields(self):
-        result = enrich_node_metadata(
-            metadata={"document_id": "d1"},
-            filename="random_file.docx",
-        )
-        assert "spec_name" not in result
-        assert result["document_id"] == "d1"

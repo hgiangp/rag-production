@@ -231,8 +231,7 @@ async def _run_indexing(
             collection=collection,
         )
         duration = time.perf_counter() - start
-        # Ensure payload indexes exist for cross-reference filtering
-        await ensure_payload_indexes(collection)
+
         # Invalidate stale engine caches so next query loads fresh nodes
         invalidate_engine_cache(collection)
         INGEST_COUNT.labels(file_type=file_type, status="success").inc()
