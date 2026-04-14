@@ -1,5 +1,6 @@
 """Chat request/response schemas — OpenAI-compatible where possible."""
 
+from datetime import datetime
 from typing import List, Literal, Optional
 from uuid import UUID
 
@@ -76,6 +77,29 @@ class StreamChunk(BaseModel):
     error: Optional[str] = None
 
 
+class SessionInfo(BaseModel):
+    session_id: UUID
+    name: str
+    created_at: datetime
+    updated_at: datetime
+    message_count: int = 0
+    last_message: Optional[str] = None
+
+
+class HistoryMessage(BaseModel):
+    id: UUID
+    role: str
+    content: str
+    citations: List[Citation] = Field(default_factory=list)
+    eval_scores: Optional[TriadScores] = None
+    created_at: datetime
+
+
 class ChatHistoryResponse(BaseModel):
     session_id: UUID
-    messages: List[Message]
+    name: str
+    messages: List[HistoryMessage]
+
+
+class CreateSessionRequest(BaseModel):
+    name: str = Field(default="New Chat", max_length=100)
