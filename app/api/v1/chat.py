@@ -19,6 +19,7 @@ from app.core.auth import CurrentUser, get_current_user
 from app.core.config import settings
 from app.core.limiter import limiter
 from app.evaluation.runner import EvalRunner
+from app.graph.language import lang_name as _lang_name
 from app.graph.main_graph import get_langfuse_handler, get_main_graph
 from app.graph.state import GraphState
 from app.models.chat_message import ChatMessage
@@ -126,7 +127,7 @@ Rules:
 - Maximum {max_chars} characters
 - 4–7 words
 - Capture the specific topic, not a generic description
-- Write in the SAME language as the user message (Japanese if Japanese, etc.)
+- YOU MUST write the title in {target_language_name}
 
 User: {query}
 Assistant: {answer}
@@ -134,8 +135,12 @@ Assistant: {answer}
 Title:"""
 
 
-async def _generate_title_llm(query: str, answer: str) -> str:
+async def _generate_title_llm(query: str, answer: str, target_language: str = "en") -> str:
     """Call the LLM to produce a concise session title from the first exchange.
+
+    The title language is determined by *target_language* (BCP-47 code), NOT by
+    the content of the messages — so an English-mode session always gets an
+    English title even when the retrieved documents contain Japanese text.
 
     Returns an empty string on any failure so the caller can fall back gracefully.
     """
@@ -145,6 +150,7 @@ async def _generate_title_llm(query: str, answer: str) -> str:
     # Truncate inputs so the title prompt stays cheap (≈ 300 tokens total).
     prompt = _TITLE_PROMPT.format(
         max_chars=max_chars,
+        target_language_name=_lang_name(target_language),
         query=query[:300],
         answer=answer[:300],
     )
@@ -161,13 +167,13 @@ async def _generate_title_llm(query: str, answer: str) -> str:
         return ""
 
 
-async def _set_session_title(session_id: UUID, query: str, answer: str) -> None:
+async def _set_session_title(session_id: UUID, query: str, answer: str, target_language: str = "en") -> None:
     """Fire-and-forget coroutine: generates an LLM title and writes it to the DB.
 
     Falls back to a truncated version of the query if the LLM call fails.
     Uses its own DB session so it can run independently of the request lifecycle.
     """
-    title = await _generate_title_llm(query, answer)
+    title = await _generate_title_llm(query, answer, target_language)
     if not title:
         # Fallback: truncate query at word boundary
         text = " ".join(query.split())
@@ -195,11 +201,14 @@ async def _save_turn(
     answer: str,
     citations: List[Citation],
     eval_scores: Optional[TriadScores] = None,
+    target_language: str = "en",
 ) -> None:
     """Persist one user + assistant turn to chat_message.
 
     On the very first turn fires a background task that asks the LLM to produce
     a short title from the exchange and writes it to session.name.
+    The title is written in *target_language* so the session name always matches
+    the UI language selection, regardless of document language.
     session.updated_at is bumped by the DB trigger on INSERT.
     """
     # Check before inserting so we know whether this is the first turn.
@@ -233,7 +242,7 @@ async def _save_turn(
         sess_result = await db.exec(select(Session).where(Session.id == session_id))
         sess = sess_result.first()
         if sess and sess.name.strip().lower() in _PLACEHOLDER_NAMES:
-            asyncio.create_task(_set_session_title(session_id, query, answer))
+            asyncio.create_task(_set_session_title(session_id, query, answer, target_language))
 
     logger.info("chat_turn_saved", session_id=str(session_id), answer_length=len(answer), first_turn=is_first_turn)
 
@@ -461,6 +470,7 @@ async def chat_invoke(
         query=body.message,
         answer=final_answer,
         citations=citations,
+        target_language=body.target_language or settings.DEFAULT_TARGET_LANGUAGE,
     )
 
     logger.info(
@@ -581,6 +591,7 @@ async def chat_stream(
                         query=body.message,
                         answer=final_answer,
                         citations=citations,
+                        target_language=body.target_language or settings.DEFAULT_TARGET_LANGUAGE,
                     )
 
             yield f"data: {StreamChunk(type='done').model_dump_json()}\n\n"
