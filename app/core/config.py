@@ -154,6 +154,10 @@ class Settings:
         self.MAX_FILE_SIZE_MB: int = _int("MAX_FILE_SIZE_MB", 50)
         self.ALLOWED_FILE_TYPES: List[str] = _list("ALLOWED_FILE_TYPES", ["pdf", "docx", "txt", "md"])
 
+        # ── Session ──────────────────────────────────────────────────────────
+        # Max characters for LLM-generated session titles (ChatGPT/Claude.ai use ~40)
+        self.SESSION_TITLE_MAX_CHARS: int = _int("SESSION_TITLE_MAX_CHARS", 40)
+
         # ── Multilingual ─────────────────────────────────────────────────────
         # BCP-47 code for the language answers are generated in when the
         # caller does not specify one.  "en" = English.

@@ -113,21 +113,79 @@ def _parse_tool_output(name: str, output: str) -> List[RetrievedChunk]:
     return _parse_llamaindex_chunks(output, name)
 
 
-# ── Message persistence helpers ────────────────────────────────────────────────
+# ── Session title generation ───────────────────────────────────────────────────
 
-def _make_title(query: str) -> str:
-    """Derive a short session title from the first user message."""
-    text = " ".join(query.split())   # collapse whitespace
-    if len(text) <= 60:
-        return text
-    # break at word boundary to avoid cutting mid-word
-    return text[:57].rsplit(" ", 1)[0] + "…"
-
-
-# Names that are considered "not yet set" — auto-naming will overwrite these.
+# Names that are considered "not yet set" — LLM title generation will overwrite these.
 _PLACEHOLDER_NAMES = {"", "chat", "new chat", "default", "new session"}
 
+_TITLE_PROMPT = """\
+Generate a short title for this conversation. Return ONLY the title — no quotes, \
+no punctuation at the end, no explanation.
 
+Rules:
+- Maximum {max_chars} characters
+- 4–7 words
+- Capture the specific topic, not a generic description
+- Write in the SAME language as the user message (Japanese if Japanese, etc.)
+
+User: {query}
+Assistant: {answer}
+
+Title:"""
+
+
+async def _generate_title_llm(query: str, answer: str) -> str:
+    """Call the LLM to produce a concise session title from the first exchange.
+
+    Returns an empty string on any failure so the caller can fall back gracefully.
+    """
+    from app.services.llm import get_llm
+
+    max_chars = settings.SESSION_TITLE_MAX_CHARS
+    # Truncate inputs so the title prompt stays cheap (≈ 300 tokens total).
+    prompt = _TITLE_PROMPT.format(
+        max_chars=max_chars,
+        query=query[:300],
+        answer=answer[:300],
+    )
+    try:
+        llm = get_llm(model=settings.DEFAULT_LLM_MODEL)
+        response = await llm.ainvoke([HumanMessage(content=prompt)])
+        title = response.content.strip().strip('"').strip("'")
+        # Hard-cap at max_chars in case the model ignores the instruction
+        if len(title) > max_chars:
+            title = title[:max_chars - 1].rsplit(" ", 1)[0] + "…"
+        return title
+    except Exception as exc:
+        logger.warning("session_title_generation_failed", error=str(exc))
+        return ""
+
+
+async def _set_session_title(session_id: UUID, query: str, answer: str) -> None:
+    """Fire-and-forget coroutine: generates an LLM title and writes it to the DB.
+
+    Falls back to a truncated version of the query if the LLM call fails.
+    Uses its own DB session so it can run independently of the request lifecycle.
+    """
+    title = await _generate_title_llm(query, answer)
+    if not title:
+        # Fallback: truncate query at word boundary
+        text = " ".join(query.split())
+        max_chars = settings.SESSION_TITLE_MAX_CHARS
+        title = text if len(text) <= max_chars else text[:max_chars - 1].rsplit(" ", 1)[0] + "…"
+
+    from app.services.database import _async_session_factory
+    async with _async_session_factory() as db:
+        result = await db.exec(select(Session).where(Session.id == session_id))
+        sess = result.first()
+        if sess:
+            sess.name = title
+            db.add(sess)
+            await db.commit()
+    logger.info("session_title_set", session_id=str(session_id), title=title)
+
+
+# ── Message persistence ────────────────────────────────────────────────────────
 
 async def _save_turn(
     db: AsyncSession,
@@ -140,10 +198,11 @@ async def _save_turn(
 ) -> None:
     """Persist one user + assistant turn to chat_message.
 
-    On the very first turn auto-names the session from the query text.
+    On the very first turn fires a background task that asks the LLM to produce
+    a short title from the exchange and writes it to session.name.
     session.updated_at is bumped by the DB trigger on INSERT.
     """
-    # Check whether this is the first message before inserting
+    # Check before inserting so we know whether this is the first turn.
     count_result = await db.exec(
         select(func.count(ChatMessage.id)).where(ChatMessage.session_id == session_id)
     )
@@ -167,16 +226,15 @@ async def _save_turn(
     )
     db.add(user_msg)
     db.add(asst_msg)
+    await db.commit()
 
-    # Auto-name session from first message when the current name is still a placeholder
+    # Fire title generation in the background — same pattern as eval (Rule R7).
     if is_first_turn:
         sess_result = await db.exec(select(Session).where(Session.id == session_id))
         sess = sess_result.first()
         if sess and sess.name.strip().lower() in _PLACEHOLDER_NAMES:
-            sess.name = _make_title(query)
-            db.add(sess)
+            asyncio.create_task(_set_session_title(session_id, query, answer))
 
-    await db.commit()
     logger.info("chat_turn_saved", session_id=str(session_id), answer_length=len(answer), first_turn=is_first_turn)
 
 
