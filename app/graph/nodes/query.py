@@ -1,7 +1,7 @@
 """Query processing nodes: summarize history, rewrite query, request clarification."""
 
 import time
-from typing import Dict, List
+from typing import List
 
 import structlog
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage
@@ -10,35 +10,10 @@ from pydantic import BaseModel, Field
 
 from app.core.config import settings
 from app.core.metrics import GRAPH_NODE_COUNT, GRAPH_NODE_LATENCY
+from app.graph.language import lang_name as _lang_name
 from app.graph.state import GraphState
 
 logger = structlog.get_logger(__name__)
-
-# ─── Language helpers ─────────────────────────────────────────────────────────
-
-_LANGUAGE_NAMES: Dict[str, str] = {
-    "en": "English",
-    "ja": "Japanese",
-    "vi": "Vietnamese",
-    "fr": "French",
-    "de": "German",
-    "zh": "Chinese",
-    "ko": "Korean",
-    "es": "Spanish",
-    "pt": "Portuguese",
-    "th": "Thai",
-    "ar": "Arabic",
-    "ru": "Russian",
-    "it": "Italian",
-    "nl": "Dutch",
-    "pl": "Polish",
-    "id": "Indonesian",
-}
-
-
-def _lang_name(code: str) -> str:
-    """Return a human-readable language name for a BCP-47 code."""
-    return _LANGUAGE_NAMES.get(code.lower(), code)
 
 
 # ─── Schemas for structured LLM output ───────────────────────────────────────

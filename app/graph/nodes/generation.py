@@ -1,7 +1,7 @@
 """Generation nodes: orchestrator, aggregate answers, fallback, collect answer."""
 
 import time
-from typing import Dict, List
+from typing import List
 
 import structlog
 from langchain_core.language_models import BaseChatModel
@@ -9,45 +9,10 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from app.core.config import settings
 from app.core.metrics import GRAPH_NODE_COUNT, GRAPH_NODE_LATENCY, LLM_LATENCY
+from app.graph.language import lang_instruction as _lang_instruction
 from app.graph.state import AgentState, GraphState
 
 logger = structlog.get_logger(__name__)
-
-# ─── Language helpers (mirror of query.py — avoid circular import) ────────────
-
-_LANGUAGE_NAMES: Dict[str, str] = {
-    "en": "English",
-    "ja": "Japanese",
-    "vi": "Vietnamese",
-    "fr": "French",
-    "de": "German",
-    "zh": "Chinese",
-    "ko": "Korean",
-    "es": "Spanish",
-    "pt": "Portuguese",
-    "th": "Thai",
-    "ar": "Arabic",
-    "ru": "Russian",
-    "it": "Italian",
-    "nl": "Dutch",
-    "pl": "Polish",
-    "id": "Indonesian",
-}
-
-
-def _lang_name(code: str) -> str:
-    return _LANGUAGE_NAMES.get(code.lower(), code)
-
-
-def _lang_instruction(target_language: str) -> str:
-    """Return a language instruction suffix to append to any system prompt."""
-    name = _lang_name(target_language)
-    return (
-        f"\n\nLANGUAGE REQUIREMENT: You MUST write your entire response in {name}. "
-        f"Retrieved context may be in a different language — read and understand it, "
-        f"then produce your answer entirely in {name}. "
-        f"Do NOT mix languages or leave untranslated fragments."
-    )
 
 
 # ─── Base system prompts ──────────────────────────────────────────────────────

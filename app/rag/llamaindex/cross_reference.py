@@ -94,13 +94,18 @@ class LLMCrossReferenceExtractor:
 
     _SYSTEM = (
         "You extract cross-references from technical specification document fragments.\n"
+        "Documents may be in English or Japanese — handle both equally.\n"
         "A cross-reference is any pointer to:\n"
         "  - A section or clause in the same document (ref_type='section'), "
-        "e.g. '4.4.1.1', 'Section 3.2', '3.1.2.3項'\n"
+        "e.g. '4.4.1.1', 'Section 3.2', '3.1.2.3項', '第3.2節'\n"
         "  - A different specification document (ref_type='document'), "
-        "e.g. 'EnlargeWA', 'SPEC \"Enlarge WA\"', '(EnlargeWA)'\n"
+        "e.g. 'EnlargeWA', 'SPEC \"Enlarge WA\"', '(EnlargeWA)', '（EnlargeWA）', '「EnlargeWA」', "
+        "'仕様書 EnlargeWA'\n"
         "Include references that appear as bare numbers in table cells with no keyword context — "
         "use surrounding column headers or row labels to fill in 'context_hint'.\n"
+        "IMPORTANT: Write 'context_hint' in the SAME language as the surrounding document text "
+        "(Japanese hint for Japanese docs, English hint for English docs) — it is used as a "
+        "semantic search query against the same document collection.\n"
         "Return an empty list when no cross-references are present."
     )
 
@@ -229,8 +234,10 @@ class CrossReferenceDetector:
         r"(?:spec(?:ification)?|document|doc)\s+([A-Z][A-Za-z0-9_\-]{2,})\b",
         # 'EnlargeWA' specification  (quoted name before keyword)
         r"['\"`「『]([A-Za-z0-9_\-]+)['\"`」』]\s+(?:spec(?:ification)?|document|仕様)",
-        # (EnlargeWA) — parenthesised spec name (alphanumeric, first letter upper)
+        # (EnlargeWA) — half-width parenthesised spec name (alphanumeric, first letter upper)
         r"\(([A-Z][A-Za-z0-9]+(?:WA|Spec)?)\)",
+        # （EnlargeWA） — full-width parentheses (common in Japanese technical docs)
+        r"（([A-Z][A-Za-z0-9]+(?:WA|Spec)?)）",
         # 「EnlargeWA」 or 『EnlargeWA』 — Japanese quotation marks
         r"[「『]([A-Za-z0-9]+)[」』]",
         # EnlargeWA specification / EnlargeWA document
@@ -280,11 +287,26 @@ class CrossReferenceDetector:
         return refs
 
     def has_references(self, text: str) -> bool:
-        """Quick check — avoids full detection when text is clean."""
+        """Quick check — avoids full detection when text is clean.
+
+        Covers both English and Japanese reference styles so the LLM extraction
+        step is not skipped when documents are in Japanese.
+        """
         quick_patterns = [
-            r"section\s+\d", r"\d+\.\d+(?:\.\d+)+", r"[項節章]",
+            # English section keywords
+            r"section\s+\d", r"clause\s+\d",
+            # Dotted numbers (language-agnostic)
+            r"\d+\.\d+(?:\.\d+)+",
+            # Japanese section/clause suffixes: 項, 節, 章
+            r"\d+(?:\.\d+)*[項節章]",
+            # English spec keywords with quoted name
             r"spec(?:ification)?\s*['\"`「『]", r"spec(?:ification)?\s+[A-Z]",
+            # Half-width parenthesised spec name: (EnlargeWA)
             r"\([A-Z][A-Za-z0-9]+\)",
+            # Full-width parenthesised spec name: （EnlargeWA）
+            r"（[A-Z][A-Za-z0-9]+）",
+            # Japanese doc/spec keywords: 仕様書, 参照
+            r"仕様書?", r"参照",
         ]
         return any(re.search(p, text, re.IGNORECASE) for p in quick_patterns)
 
@@ -297,12 +319,16 @@ _spec_name_cache: Dict[str, List[str]] = {}
 
 
 def _normalize_spec_name(name: str) -> str:
-    """Lowercase and strip non-alphanumeric chars for fuzzy comparison.
+    """Lowercase and strip non-word chars for fuzzy comparison.
+
+    Preserves Unicode word characters (letters + digits across all scripts)
+    so that Japanese spec names such as '拡大WA' normalise correctly.
 
     'Enlarge WA' → 'enlargewa'
     'enlagreWA'  → 'enlargewa'   (close enough for difflib tier-2)
+    '拡大WA'     → '拡大wa'
     """
-    return re.sub(r"[^a-z0-9]", "", name.lower())
+    return re.sub(r"[^\w]", "", name, flags=re.UNICODE).lower()
 
 
 def invalidate_spec_name_cache(collection: str = "") -> None:
