@@ -106,6 +106,19 @@ def _create_session(name: str) -> Optional[dict]:
     return None
 
 
+def _delete_session(session_id: str) -> bool:
+    """Delete a session and all its messages. Returns True on success."""
+    try:
+        resp = httpx.delete(
+            f"{API_V1}/chat/sessions/{session_id}",
+            headers=_headers(),
+            timeout=10.0,
+        )
+        return resp.status_code == 204
+    except Exception:
+        return False
+
+
 def _switch_session(session_id: str) -> None:
     """Load history for a session and set it as active."""
     messages = _fetch_history(session_id)
@@ -256,14 +269,29 @@ def _sidebar() -> None:
                 is_active = sid == st.session_state.active_session_id
 
                 label = f"**{name}**" if is_active else name
-                caption = f"{count // 2} turn(s)"
+                tooltip = f"{count // 2} turn(s)"
                 if preview:
-                    caption += f" · {preview[:40]}{'…' if len(preview) > 40 else ''}"
+                    tooltip += f" · {preview[:50]}{'…' if len(preview) > 50 else ''}"
 
-                if st.button(label, key=f"sess_{sid}", help=caption, use_container_width=True):
-                    if sid != st.session_state.active_session_id:
-                        _switch_session(sid)
-                        st.rerun()
+                col_name, col_del = st.columns([5, 1])
+                with col_name:
+                    if st.button(label, key=f"sess_{sid}", help=tooltip, use_container_width=True):
+                        if sid != st.session_state.active_session_id:
+                            _switch_session(sid)
+                            st.rerun()
+                with col_del:
+                    if st.button("🗑", key=f"del_{sid}", help="Delete this chat"):
+                        if _delete_session(sid):
+                            st.session_state.sessions = _fetch_sessions()
+                            # If we deleted the active session, switch to the next one
+                            if sid == st.session_state.active_session_id:
+                                remaining = st.session_state.sessions
+                                if remaining:
+                                    _switch_session(remaining[0]["session_id"])
+                                else:
+                                    st.session_state.active_session_id = None
+                                    st.session_state.messages = []
+                            st.rerun()
         else:
             st.caption("No sessions yet")
 

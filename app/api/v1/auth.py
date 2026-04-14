@@ -7,6 +7,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.core.auth import create_access_token, hash_password, verify_password
 from app.core.limiter import limiter
+from app.models.chat_message import ChatMessage
 from app.models.session import Session
 from app.models.user import User
 from app.schemas.auth import LoginRequest, RegisterRequest, TokenResponse
@@ -56,9 +57,25 @@ async def login(
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account disabled")
 
-    session = Session(user_id=user.id)
-    db.add(session)
-    await db.flush()
+    # Reuse the user's most recent session that still has messages (avoid creating
+    # a new empty session on every login, which would pollute the session list).
+    from sqlalchemy import exists as sa_exists
+    recent_result = await db.exec(
+        select(Session)
+        .where(
+            Session.user_id == user.id,
+            sa_exists().where(ChatMessage.session_id == Session.id),
+        )
+        .order_by(Session.updated_at.desc())
+        .limit(1)
+    )
+    session = recent_result.first()
+
+    if session is None:
+        # First ever login or all previous sessions are empty — create a fresh one
+        session = Session(user_id=user.id, name="")
+        db.add(session)
+        await db.flush()
 
     token = create_access_token(user.id, session.id)
     logger.info("user_logged_in", user_id=str(user.id), session_id=str(session.id))

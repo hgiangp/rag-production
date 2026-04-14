@@ -11,6 +11,7 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
+from sqlalchemy import exists
 from sqlmodel import func, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -112,7 +113,16 @@ def _parse_tool_output(name: str, output: str) -> List[RetrievedChunk]:
     return _parse_llamaindex_chunks(output, name)
 
 
-# ── Message persistence helper ─────────────────────────────────────────────────
+# ── Message persistence helpers ────────────────────────────────────────────────
+
+def _make_title(query: str) -> str:
+    """Derive a short session title from the first user message."""
+    text = " ".join(query.split())   # collapse whitespace
+    if len(text) <= 60:
+        return text
+    # break at word boundary to avoid cutting mid-word
+    return text[:57].rsplit(" ", 1)[0] + "…"
+
 
 async def _save_turn(
     db: AsyncSession,
@@ -123,7 +133,17 @@ async def _save_turn(
     citations: List[Citation],
     eval_scores: Optional[TriadScores] = None,
 ) -> None:
-    """Persist one user + assistant turn to chat_message. Fire-and-forget safe."""
+    """Persist one user + assistant turn to chat_message.
+
+    On the very first turn auto-names the session from the query text.
+    session.updated_at is bumped by the DB trigger on INSERT.
+    """
+    # Check whether this is the first message before inserting
+    count_result = await db.exec(
+        select(func.count(ChatMessage.id)).where(ChatMessage.session_id == session_id)
+    )
+    is_first_turn = count_result.one() == 0
+
     user_msg = ChatMessage(
         session_id=session_id,
         user_id=user_id,
@@ -142,9 +162,17 @@ async def _save_turn(
     )
     db.add(user_msg)
     db.add(asst_msg)
-    # session.updated_at is bumped by the DB trigger on INSERT into chat_message
+
+    # Auto-name session from first message
+    if is_first_turn:
+        sess_result = await db.exec(select(Session).where(Session.id == session_id))
+        sess = sess_result.first()
+        if sess and not sess.name.strip():
+            sess.name = _make_title(query)
+            db.add(sess)
+
     await db.commit()
-    logger.info("chat_turn_saved", session_id=str(session_id), answer_length=len(answer))
+    logger.info("chat_turn_saved", session_id=str(session_id), answer_length=len(answer), first_turn=is_first_turn)
 
 
 def _build_initial_state(body: ChatRequest, current_user: CurrentUser, correlation_id: str, session_id: UUID) -> GraphState:
@@ -176,10 +204,16 @@ async def list_sessions(
     current_user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> List[SessionInfo]:
-    """List all chat sessions for the current user, newest first."""
+    """List chat sessions for the current user that have at least one message, newest first.
+
+    Empty sessions (created at login but never used) are excluded.
+    """
     result = await db.exec(
         select(Session)
-        .where(Session.user_id == current_user.user_id)
+        .where(
+            Session.user_id == current_user.user_id,
+            exists().where(ChatMessage.session_id == Session.id),
+        )
         .order_by(Session.updated_at.desc())
         .limit(50)
     )
@@ -275,6 +309,26 @@ async def get_session_history(
         ))
 
     return ChatHistoryResponse(session_id=session_id, name=sess.name or "Chat", messages=history)
+
+
+@router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+@limiter.limit("30/minute")
+async def delete_session(
+    request: Request,
+    session_id: UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> None:
+    """Delete a session and all its messages (cascades via FK)."""
+    sess_result = await db.exec(
+        select(Session).where(Session.id == session_id, Session.user_id == current_user.user_id)
+    )
+    sess = sess_result.first()
+    if not sess:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+    await db.delete(sess)
+    await db.commit()
+    logger.info("session_deleted", session_id=str(session_id), user_id=str(current_user.user_id))
 
 
 # ── Chat endpoints ─────────────────────────────────────────────────────────────
