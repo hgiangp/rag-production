@@ -1,7 +1,7 @@
 """Generation nodes: orchestrator, aggregate answers, fallback, collect answer."""
 
 import time
-from typing import List
+from typing import Dict, List
 
 import structlog
 from langchain_core.language_models import BaseChatModel
@@ -13,7 +13,46 @@ from app.graph.state import AgentState, GraphState
 
 logger = structlog.get_logger(__name__)
 
-_ORCHESTRATOR_SYSTEM = (
+# ─── Language helpers (mirror of query.py — avoid circular import) ────────────
+
+_LANGUAGE_NAMES: Dict[str, str] = {
+    "en": "English",
+    "ja": "Japanese",
+    "vi": "Vietnamese",
+    "fr": "French",
+    "de": "German",
+    "zh": "Chinese",
+    "ko": "Korean",
+    "es": "Spanish",
+    "pt": "Portuguese",
+    "th": "Thai",
+    "ar": "Arabic",
+    "ru": "Russian",
+    "it": "Italian",
+    "nl": "Dutch",
+    "pl": "Polish",
+    "id": "Indonesian",
+}
+
+
+def _lang_name(code: str) -> str:
+    return _LANGUAGE_NAMES.get(code.lower(), code)
+
+
+def _lang_instruction(target_language: str) -> str:
+    """Return a language instruction suffix to append to any system prompt."""
+    name = _lang_name(target_language)
+    return (
+        f"\n\nLANGUAGE REQUIREMENT: You MUST write your entire response in {name}. "
+        f"Retrieved context may be in a different language — read and understand it, "
+        f"then produce your answer entirely in {name}. "
+        f"Do NOT mix languages or leave untranslated fragments."
+    )
+
+
+# ─── Base system prompts ──────────────────────────────────────────────────────
+
+_ORCHESTRATOR_SYSTEM_BASE = (
     "You are a research assistant with access to document search tools. "
     "To answer the user's question:\n"
     "1. ALWAYS start by calling llamaindex_query to find relevant context\n"
@@ -27,13 +66,13 @@ _ORCHESTRATOR_SYSTEM = (
     "Never answer from memory alone — always ground answers in retrieved documents."
 )
 
-_FALLBACK_SYSTEM = (
+_FALLBACK_SYSTEM_BASE = (
     "The document search did not return sufficient results for the user's question. "
     "Acknowledge this honestly and suggest what information the user might need to provide "
     "or what alternative approach might help. Do not fabricate information."
 )
 
-_AGGREGATE_SYSTEM = (
+_AGGREGATE_SYSTEM_BASE = (
     "You are synthesizing answers from multiple research agents. "
     "Combine their findings into a single, coherent, well-structured answer. "
     "Eliminate redundancy, resolve any contradictions, and cite sources appropriately. "
@@ -46,7 +85,9 @@ async def orchestrator(state: AgentState, llm_with_tools: BaseChatModel) -> dict
     start = time.perf_counter()
     GRAPH_NODE_COUNT.labels(node="orchestrator").inc()
 
-    sys_msg = SystemMessage(content=_ORCHESTRATOR_SYSTEM)
+    target_lang = state.get("target_language") or settings.DEFAULT_TARGET_LANGUAGE
+    sys_content = _ORCHESTRATOR_SYSTEM_BASE + _lang_instruction(target_lang)
+    sys_msg = SystemMessage(content=sys_content)
     context_summary = state.get("context_summary", "").strip()
 
     injection = []
@@ -96,9 +137,11 @@ async def fallback_response(state: AgentState, llm: BaseChatModel) -> dict:
     """Generate an honest fallback when retrieval is insufficient."""
     GRAPH_NODE_COUNT.labels(node="fallback_response").inc()
 
+    target_lang = state.get("target_language") or settings.DEFAULT_TARGET_LANGUAGE
+    sys_content = _FALLBACK_SYSTEM_BASE + _lang_instruction(target_lang)
     question = state.get("question", "the question")
     resp = await llm.ainvoke([
-        SystemMessage(content=_FALLBACK_SYSTEM),
+        SystemMessage(content=sys_content),
         HumanMessage(content=f"Question: {question}"),
     ])
     logger.info("fallback_response_generated")
@@ -135,15 +178,18 @@ async def aggregate_answers(state: GraphState, llm: BaseChatModel) -> dict:
             seen.add(h)
             unique_contexts.append(ctx)
 
+    target_lang = state.get("target_language") or settings.DEFAULT_TARGET_LANGUAGE
+
     if len(answers) == 1:
         GRAPH_NODE_LATENCY.labels(node="aggregate_answers").observe(time.perf_counter() - start)
         return {"final_answer": answers[0], "retrieved_contexts": unique_contexts}
 
     combined = "\n\n---\n\n".join(f"[Answer {i+1}]\n{a}" for i, a in enumerate(answers))
     prompt = f"Original question: {state.get('original_query', '')}\n\nAnswers to synthesize:\n{combined}"
+    sys_content = _AGGREGATE_SYSTEM_BASE + _lang_instruction(target_lang)
 
     resp = await llm.ainvoke([
-        SystemMessage(content=_AGGREGATE_SYSTEM),
+        SystemMessage(content=sys_content),
         HumanMessage(content=prompt),
     ])
 

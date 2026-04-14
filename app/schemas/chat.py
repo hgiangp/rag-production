@@ -39,6 +39,14 @@ class ChatRequest(BaseModel):
     stream: bool = False
     collection: Optional[str] = Field(None, description="Override default user collection")
     model: Optional[str] = Field(None, description="Override default LLM model")
+    target_language: str = Field(
+        "en",
+        description=(
+            "BCP-47 language code for the answer language (e.g. 'en', 'ja', 'vi', 'fr'). "
+            "Defaults to English. The answer will be generated in this language regardless "
+            "of the query or document language."
+        ),
+    )
 
 
 class ChatResponse(BaseModel):

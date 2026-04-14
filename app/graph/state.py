@@ -56,6 +56,10 @@ class GraphState(TypedDict, total=False):
     session_id: str
     correlation_id: str
 
+    # ── Multilingual ──────────────────────────────────────────────────────────
+    query_language: str       # BCP-47 code auto-detected from user query (set by rewrite_query)
+    target_language: str      # BCP-47 code for the answer language (from ChatRequest, default "en")
+
     # ── Self-correction ───────────────────────────────────────────────────────
     self_correction_count: int         # incremented on each re-query cycle
 
@@ -71,3 +75,4 @@ class AgentState(TypedDict, total=False):
     user_id: str                       # propagated from GraphState for tool collection routing
     correlation_id: str                # propagated for Langfuse span linking inside tools
     cross_ref_targets: List[CrossRefTarget]  # set by detect_cross_references, cleared after fetch
+    target_language: str               # propagated from GraphState — answer language for this agent

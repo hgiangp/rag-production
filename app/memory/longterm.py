@@ -123,7 +123,15 @@ class LongTermMemory:
 
     @retry(stop=stop_after_attempt(2), wait=wait_exponential(min=1, max=5))
     async def add(self, user_id: str, messages: List[Dict[str, str]]) -> None:
-        """Add conversation turn to long-term memory."""
+        """
+        Add conversation turn to long-term memory.
+
+        Args:
+            user_id: The user identifier.
+            messages: List of message dicts, each with required keys:
+                - "role": str, e.g., "user" or "assistant"
+                - "content": str, the message text
+        """
         try:
             await self._ensure_collection()
             memory = self._get_memory()

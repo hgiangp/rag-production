@@ -23,12 +23,30 @@ st.set_page_config(page_title="RAG Chatbot", page_icon="🤖", layout="wide")
 
 # ─── Session state helpers ────────────────────────────────────────────────────
 
+_LANGUAGES = {
+    "English": "en",
+    "Japanese": "ja",
+    "Vietnamese": "vi",
+    "French": "fr",
+    "German": "de",
+    "Chinese": "zh",
+    "Korean": "ko",
+    "Spanish": "es",
+    "Portuguese": "pt",
+    "Thai": "th",
+    "Arabic": "ar",
+    "Russian": "ru",
+    "Indonesian": "id",
+}
+
+
 def _init_state() -> None:
     defaults = {
         "token": None,
         "session_id": None,
         "messages": [],
         "eval_scores": [],
+        "target_language": "en",
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -113,6 +131,18 @@ def _sidebar() -> None:
 
         st.divider()
 
+        # Answer language selector
+        st.markdown("### 🌐 Answer Language")
+        lang_label = st.selectbox(
+            "Respond in",
+            options=list(_LANGUAGES.keys()),
+            index=list(_LANGUAGES.values()).index(st.session_state.target_language),
+            label_visibility="collapsed",
+        )
+        st.session_state.target_language = _LANGUAGES[lang_label]
+
+        st.divider()
+
         # Eval summary
         st.markdown("### 📊 Eval Scores (last 10)")
         if st.session_state.eval_scores:
@@ -173,6 +203,7 @@ def _chat_page() -> None:
                         json={
                             "message": prompt,
                             "session_id": st.session_state.session_id,
+                            "target_language": st.session_state.target_language,
                         },
                         timeout=600.0,
                     )

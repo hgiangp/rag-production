@@ -137,6 +137,8 @@ async def chat_invoke(
         retrieved_contexts=[],
         source_citations=[],
         self_correction_count=0,
+        target_language=body.target_language or settings.DEFAULT_TARGET_LANGUAGE,
+        query_language="",  # populated by rewrite_query node
     )
 
     langfuse_handler = get_langfuse_handler(trace_id=correlation_id)
@@ -225,6 +227,8 @@ async def chat_stream(
             retrieved_contexts=[],
             source_citations=[],
             self_correction_count=0,
+            target_language=body.target_language or settings.DEFAULT_TARGET_LANGUAGE,
+            query_language="",  # populated by rewrite_query node
         )
         langfuse_handler = get_langfuse_handler(trace_id=correlation_id)
         config = {

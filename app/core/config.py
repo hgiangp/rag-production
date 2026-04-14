@@ -154,6 +154,15 @@ class Settings:
         self.MAX_FILE_SIZE_MB: int = _int("MAX_FILE_SIZE_MB", 50)
         self.ALLOWED_FILE_TYPES: List[str] = _list("ALLOWED_FILE_TYPES", ["pdf", "docx", "txt", "md"])
 
+        # ── Multilingual ─────────────────────────────────────────────────────
+        # BCP-47 code for the language answers are generated in when the
+        # caller does not specify one.  "en" = English.
+        self.DEFAULT_TARGET_LANGUAGE: str = os.getenv("DEFAULT_TARGET_LANGUAGE", "en")
+        # Primary language of the indexed document collection (BCP-47).
+        # Used to steer cross-lingual query rewriting toward document-language
+        # keywords for accurate retrieval.
+        self.DOCUMENT_LANGUAGE: str = os.getenv("DOCUMENT_LANGUAGE", "en")
+
         # ── LlamaIndex ───────────────────────────────────────────────────────
         self.LLAMAINDEX_SIMILARITY_TOP_K: int = _int("LLAMAINDEX_SIMILARITY_TOP_K", 5)
         self.LLAMAINDEX_AUTO_MERGE_CHUNK_SIZES: List[int] = [
