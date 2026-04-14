@@ -124,6 +124,11 @@ def _make_title(query: str) -> str:
     return text[:57].rsplit(" ", 1)[0] + "…"
 
 
+# Names that are considered "not yet set" — auto-naming will overwrite these.
+_PLACEHOLDER_NAMES = {"", "chat", "new chat", "default", "new session"}
+
+
+
 async def _save_turn(
     db: AsyncSession,
     user_id: UUID,
@@ -163,11 +168,11 @@ async def _save_turn(
     db.add(user_msg)
     db.add(asst_msg)
 
-    # Auto-name session from first message
+    # Auto-name session from first message when the current name is still a placeholder
     if is_first_turn:
         sess_result = await db.exec(select(Session).where(Session.id == session_id))
         sess = sess_result.first()
-        if sess and not sess.name.strip():
+        if sess and sess.name.strip().lower() in _PLACEHOLDER_NAMES:
             sess.name = _make_title(query)
             db.add(sess)
 
@@ -256,8 +261,8 @@ async def create_session(
     current_user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> SessionInfo:
-    """Create a new named chat session for the current user."""
-    sess = Session(user_id=current_user.user_id, name=body.name)
+    """Create a new chat session. The title is set automatically from the first message."""
+    sess = Session(user_id=current_user.user_id, name="")
     db.add(sess)
     await db.commit()
     await db.refresh(sess)

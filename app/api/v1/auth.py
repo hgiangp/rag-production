@@ -32,7 +32,7 @@ async def register(
     db.add(user)
     await db.flush()
 
-    session = Session(user_id=user.id, name="Default")
+    session = Session(user_id=user.id, name="")
     db.add(session)
     await db.flush()
 

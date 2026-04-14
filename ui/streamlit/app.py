@@ -244,20 +244,18 @@ def _sidebar() -> None:
         # ── Session management ─────────────────────────────────────────────────
         st.markdown("### Chat Sessions")
 
-        col_new, col_refresh = st.columns([3, 1])
+        col_new, col_refresh = st.columns([1, 1])
         with col_new:
-            new_name = st.text_input("Session name", value="New Chat", label_visibility="collapsed", key="new_session_name")
-        with col_refresh:
-            if st.button("＋", help="Create new session"):
-                info = _create_session(new_name or "New Chat")
+            if st.button("＋ New Chat", use_container_width=True, help="Start a new conversation"):
+                info = _create_session("")
                 if info:
                     st.session_state.sessions = _fetch_sessions()
                     _switch_session(info["session_id"])
                     st.rerun()
-
-        if st.button("Refresh sessions", use_container_width=True):
-            st.session_state.sessions = _fetch_sessions()
-            st.rerun()
+        with col_refresh:
+            if st.button("↺ Refresh", use_container_width=True, help="Reload session list"):
+                st.session_state.sessions = _fetch_sessions()
+                st.rerun()
 
         sessions = st.session_state.sessions
         if sessions:
