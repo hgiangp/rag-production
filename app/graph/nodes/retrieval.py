@@ -1,5 +1,6 @@
 """Retrieval nodes: token estimation, context compression, cross-reference resolution."""
 
+import asyncio
 from typing import List, Optional
 
 import structlog
@@ -102,8 +103,19 @@ async def detect_cross_references(state: AgentState, llm: BaseChatModel) -> dict
     injection (identified by a HumanMessage starting with '[Cross-reference context]'),
     so repeated passes through the node never re-process the same tool output.
 
-    Uses the regex CrossReferenceDetector as a cheap pre-screen; skips the LLM
-    call entirely when no candidate text is found.
+    Strategy (avoids timeout on large/many chunks):
+      1. Dedup tool message contents by hash — identical chunks from repeat tool
+         calls are processed only once.
+      2. Regex pre-screen per chunk — chunks with no reference patterns skip the
+         LLM call entirely.
+      3. Truncate each candidate chunk to _MAX_CHUNK_CHARS — cross-references
+         appear in headers/tables near the top of parent chunks; the tail is safe
+         to drop for detection purposes.
+      4. Run one LLM structured-extraction call per candidate chunk in parallel
+         via asyncio.gather, each with a hard timeout. This bounds each call to
+         ~300 tokens instead of potentially 20k+ tokens for the full combined text.
+      5. Merge extracted targets and dedup by (spec_name, section_number) so
+         duplicate refs across chunks fire only one retrieval round-trip.
 
     Returns:
         {"cross_ref_targets": [...]} — empty list if nothing detected.
@@ -125,36 +137,81 @@ async def detect_cross_references(state: AgentState, llm: BaseChatModel) -> dict
     if not recent_tool_msgs:
         return {"cross_ref_targets": []}
 
-    # Fast regex pre-screen — avoids LLM call on clean text.
-    detector = CrossReferenceDetector()
-    combined = "\n---\n".join(m.content for m in recent_tool_msgs if m.content)
-    if not detector.has_references(combined):
-        logger.debug("detect_cross_references_skipped", reason="no_refs_in_tool_output")
+    # Step 1: deduplicate chunk contents by hash.
+    seen_hashes: set[int] = set()
+    unique_chunks: List[str] = []
+    for m in recent_tool_msgs:
+        if not m.content:
+            continue
+        h = hash(m.content.strip())
+        if h not in seen_hashes:
+            seen_hashes.add(h)
+            unique_chunks.append(m.content)
+
+    if not unique_chunks:
         return {"cross_ref_targets": []}
 
-    # LLM structured extraction across all recent tool results in one call.
-    try:
-        structured_llm = llm.with_structured_output(_CrossRefDetectionOutput)
-        result: _CrossRefDetectionOutput = await structured_llm.ainvoke([
-            HumanMessage(content=f"{_DETECT_SYSTEM}\n\nChunks:\n{combined}"),
-        ])
-        targets: List[CrossRefTarget] = [
-            CrossRefTarget(
-                spec_name=t.spec_name,
-                section_number=t.section_number or "",
-                query=t.query,
-            )
-            for t in result.targets
-            if t.spec_name.strip()
-        ]
-    except Exception as exc:
-        logger.warning("detect_cross_references_llm_failed", error=str(exc))
+    # Step 2: regex pre-screen per chunk — skip chunks with no reference patterns.
+    detector = CrossReferenceDetector()
+    candidate_chunks = [c for c in unique_chunks if detector.has_references(c)]
+    if not candidate_chunks:
+        logger.debug(
+            "detect_cross_references_skipped",
+            reason="no_refs_in_tool_output",
+            total_chunks=len(unique_chunks),
+        )
         return {"cross_ref_targets": []}
+
+    # Step 3: truncate — cross-refs live in headers/tables near the chunk top.
+    _MAX_CHUNK_CHARS = 1500
+    _LLM_TIMEOUT_SECS = 25
+    truncated = [c[:_MAX_CHUNK_CHARS] for c in candidate_chunks]
+
+    # Step 4: parallel per-chunk LLM extraction with per-call timeout.
+    structured_llm = llm.with_structured_output(_CrossRefDetectionOutput)
+
+    async def _extract_one(chunk: str) -> List[CrossRefTarget]:
+        try:
+            result: _CrossRefDetectionOutput = await asyncio.wait_for(
+                structured_llm.ainvoke([
+                    HumanMessage(content=f"{_DETECT_SYSTEM}\n\nChunks:\n{chunk}"),
+                ]),
+                timeout=_LLM_TIMEOUT_SECS,
+            )
+            return [
+                CrossRefTarget(
+                    spec_name=t.spec_name,
+                    section_number=t.section_number or "",
+                    query=t.query,
+                )
+                for t in result.targets
+                if t.spec_name.strip()
+            ]
+        except asyncio.TimeoutError:
+            logger.warning("detect_cross_references_chunk_timeout", timeout=_LLM_TIMEOUT_SECS)
+            return []
+        except Exception as exc:
+            logger.warning("detect_cross_references_chunk_failed", error=str(exc))
+            return []
+
+    chunk_results = await asyncio.gather(*[_extract_one(c) for c in truncated])
+
+    # Step 5: merge and dedup targets by (spec_name, section_number).
+    seen_keys: set[str] = set()
+    targets: List[CrossRefTarget] = []
+    for chunk_targets in chunk_results:
+        for t in chunk_targets:
+            key = f"{t.spec_name.strip().lower()}::{(t.section_number or '').strip()}"
+            if key not in seen_keys:
+                seen_keys.add(key)
+                targets.append(t)
 
     logger.info(
         "cross_references_detected",
         target_count=len(targets),
-        tool_msg_count=len(recent_tool_msgs),
+        candidate_chunks=len(candidate_chunks),
+        total_unique_chunks=len(unique_chunks),
+        total_tool_msgs=len(recent_tool_msgs),
     )
     GRAPH_NODE_LATENCY.labels(node="detect_cross_references")
     return {"cross_ref_targets": targets}
