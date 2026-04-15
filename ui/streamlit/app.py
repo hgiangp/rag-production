@@ -3,12 +3,13 @@
 Features:
 - Login / Register
 - Document upload (PDF, DOCX, TXT, MD)
-- Chat with source citations
-- RAG triad scores per response
+- Chat with SSE streaming and live workflow transparency panel
+- Source citations and RAG triad scores per response
 - Session list with history (persisted in PostgreSQL via API)
 - Create new session / switch sessions
 """
 
+import json
 import os
 import time
 from typing import List, Optional
@@ -38,6 +39,15 @@ _LANGUAGES = {
     "Arabic": "ar",
     "Russian": "ru",
     "Indonesian": "id",
+}
+
+# Icon per workflow step type
+_STEP_ICONS = {
+    "query_rewrite": "🔍",
+    "tool_retrieval": "📄",
+    "cross_ref_detected": "🔗",
+    "cross_ref_fetched": "📋",
+    "aggregation": "🧩",
 }
 
 
@@ -139,8 +149,101 @@ def _history_to_display(api_messages: List[dict]) -> List[dict]:
             "content": m["content"],
             "citations": m.get("citations", []),
             "eval": m.get("eval_scores"),
+            "workflow_steps": m.get("workflow_steps", []),
         })
     return display
+
+
+# ─── Streaming helper ─────────────────────────────────────────────────────────
+
+def _stream_chat(prompt: str, session_id: str, target_language: str):
+    """Generator that parses SSE chunks from /chat/stream.
+
+    Yields parsed chunk dicts: {type, content, citations, workflow_step, ...}
+    Uses httpx synchronous streaming — no new dependencies needed.
+    """
+    url = f"{API_V1}/chat/stream"
+    payload = {
+        "message": prompt,
+        "session_id": session_id,
+        "target_language": target_language,
+    }
+    with httpx.stream(
+        "POST",
+        url,
+        headers=_headers(),
+        json=payload,
+        timeout=600.0,
+    ) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines():
+            if not line.startswith("data: "):
+                continue
+            raw = line[len("data: "):]
+            try:
+                yield json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+
+# ─── Workflow step rendering ──────────────────────────────────────────────────
+
+def _render_workflow_step(step: dict) -> None:
+    """Render a single completed WorkflowStep dict inside a nested expander."""
+    step_type = step.get("step_type", "")
+    title = step.get("title", "Step")
+    duration = step.get("duration_ms")
+    data = step.get("data") or {}
+    icon = _STEP_ICONS.get(step_type, "•")
+    dur_str = f" — {duration}ms" if duration is not None else ""
+
+    with st.expander(f"{icon} {title}{dur_str}", expanded=False):
+        if step_type == "query_rewrite":
+            lang = data.get("detected_language", "")
+            questions = data.get("sub_questions", [])
+            if lang:
+                st.caption(f"Detected language: `{lang}`")
+            for i, q in enumerate(questions, 1):
+                st.markdown(f"**Q{i}:** {q}")
+
+        elif step_type == "tool_retrieval":
+            tool = data.get("tool_name", "")
+            chunks = data.get("chunks", [])
+            if not chunks:
+                st.caption(f"No results from `{tool}`")
+            else:
+                st.caption(f"Tool: `{tool}`")
+                for chunk in chunks:
+                    score = chunk.get("score")
+                    score_str = f" (score: {score:.2f})" if isinstance(score, (int, float)) else ""
+                    src = chunk.get("source", "unknown")
+                    with st.expander(f"{src}{score_str}", expanded=False):
+                        st.text(chunk.get("content", "")[:400])
+
+        elif step_type == "cross_ref_detected":
+            refs = data.get("references", [])
+            if refs:
+                for r in refs:
+                    st.markdown(f"- {r}")
+            else:
+                st.caption("No cross-references detected.")
+
+        elif step_type == "cross_ref_fetched":
+            n = data.get("contexts_injected", 0)
+            st.markdown(f"{n} context block(s) injected from cross-references.")
+
+        elif step_type == "aggregation":
+            n = data.get("sub_answer_count", 1)
+            st.markdown(f"Merged {n} sub-answer(s) into the final response.")
+
+
+def _render_workflow_steps_panel(steps: list, expanded: bool = False) -> None:
+    """Render a collapsed/expandable panel of completed workflow steps."""
+    if not steps:
+        return
+    with st.expander(f"Pipeline steps ({len(steps)} step(s))", expanded=expanded):
+        for step in steps:
+            _render_workflow_step(step)
 
 
 # ─── Auth forms ───────────────────────────────────────────────────────────────
@@ -340,6 +443,8 @@ def _chat_page() -> None:
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
+            # Workflow steps from history (collapsed by default)
+            _render_workflow_steps_panel(msg.get("workflow_steps", []), expanded=False)
             if msg.get("citations"):
                 with st.expander(f"📚 {len(msg['citations'])} source(s)"):
                     for cite in msg["citations"]:
@@ -361,63 +466,81 @@ def _chat_page() -> None:
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                try:
-                    start = time.time()
-                    resp = httpx.post(
-                        f"{API_V1}/chat/invoke",
-                        headers=_headers(),
-                        json={
-                            "message": prompt,
-                            "session_id": st.session_state.active_session_id,
-                            "target_language": st.session_state.target_language,
-                        },
-                        timeout=600.0,
-                    )
-                    latency = int((time.time() - start) * 1000)
+            # Live indicator: shows the current pipeline step while streaming
+            step_status = st.empty()
+            answer_placeholder = st.empty()
 
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        answer = data["message"]["content"]
-                        citations = data.get("citations", [])
-                        eval_scores = data.get("eval_scores") or {}
+            accumulated_tokens: List[str] = []
+            completed_steps: List[dict] = []
+            final_citations: List[dict] = []
 
-                        st.markdown(answer)
+            try:
+                for chunk in _stream_chat(
+                    prompt,
+                    st.session_state.active_session_id,
+                    st.session_state.target_language,
+                ):
+                    chunk_type = chunk.get("type")
 
-                        if citations:
-                            with st.expander(f"📚 {len(citations)} source(s)"):
-                                for cite in citations:
-                                    st.markdown(
-                                        f"**{cite['filename']}** (score: {cite['score']:.2f})\n"
-                                        f"> {cite['excerpt']}"
-                                    )
+                    if chunk_type == "workflow_step":
+                        ws = chunk.get("workflow_step") or {}
+                        icon = _STEP_ICONS.get(ws.get("step_type", ""), "•")
+                        if ws.get("status") == "running":
+                            step_status.markdown(f"_{icon} {ws.get('title', 'Working')}..._")
+                        elif ws.get("status") == "done":
+                            completed_steps.append(ws)
+                            step_status.markdown(f"_{icon} {ws.get('title')}_ ✓")
 
-                        if eval_scores:
-                            cols = st.columns(4)
-                            cols[0].metric("Latency", f"{latency}ms")
-                            cols[1].metric("Context Rel.", f"{eval_scores.get('context_relevance', 'N/A'):.2f}" if eval_scores.get("context_relevance") is not None else "N/A")
-                            cols[2].metric("Groundedness", f"{eval_scores.get('groundedness', 'N/A'):.2f}" if eval_scores.get("groundedness") is not None else "N/A")
-                            cols[3].metric("Answer Rel.", f"{eval_scores.get('answer_relevance', 'N/A'):.2f}" if eval_scores.get("answer_relevance") is not None else "N/A")
+                    elif chunk_type == "token":
+                        accumulated_tokens.append(chunk.get("content", ""))
+                        # Typing cursor while tokens arrive
+                        answer_placeholder.markdown("".join(accumulated_tokens) + "▌")
 
-                        st.session_state.messages.append({
-                            "role": "assistant",
-                            "content": answer,
-                            "citations": citations,
-                            "eval": eval_scores,
-                        })
-                        if eval_scores:
-                            st.session_state.eval_scores.append(eval_scores)
+                    elif chunk_type == "citation":
+                        final_citations = chunk.get("citations") or []
 
-                        # Refresh session list so updated_at / preview update
-                        st.session_state.sessions = _fetch_sessions()
+                    elif chunk_type == "done":
+                        step_status.empty()
+                        break
 
-                    else:
-                        error_msg = resp.json().get("detail", "Request failed")
-                        st.error(error_msg)
-                        st.session_state.messages.append({"role": "assistant", "content": f"Error: {error_msg}"})
+                    elif chunk_type == "error":
+                        step_status.empty()
+                        st.error(chunk.get("error", "Unknown streaming error"))
+                        break
 
-                except Exception as exc:
-                    st.error(f"Connection error: {exc}")
+                # Final render — replace cursor with clean answer
+                full_answer = "".join(accumulated_tokens)
+                answer_placeholder.markdown(full_answer)
+
+                # Workflow steps panel (collapsed, user can expand)
+                _render_workflow_steps_panel(completed_steps, expanded=False)
+
+                if final_citations:
+                    with st.expander(f"📚 {len(final_citations)} source(s)", expanded=False):
+                        for cite in final_citations:
+                            score = cite.get("score")
+                            score_str = f"{score:.2f}" if isinstance(score, (int, float)) else "N/A"
+                            st.markdown(
+                                f"**{cite.get('filename', 'unknown')}** (score: {score_str})\n"
+                                f"> {cite.get('excerpt', '')}"
+                            )
+
+                # Persist in session state
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": full_answer,
+                    "citations": final_citations,
+                    "eval": None,       # eval scores arrive async post-response
+                    "workflow_steps": completed_steps,
+                })
+
+                # Refresh session list (updated_at / preview)
+                st.session_state.sessions = _fetch_sessions()
+
+            except Exception as exc:
+                step_status.empty()
+                answer_placeholder.empty()
+                st.error(f"Stream error: {exc}")
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────

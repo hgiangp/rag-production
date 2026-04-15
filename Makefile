@@ -84,11 +84,49 @@ docker-services:
 	APP_ENV=$(ENV) $(DOCKER_COMPOSE) --env-file $$ENV_FILE up -d db qdrant prometheus grafana
 
 # ─── Database ────────────────────────────────────────────────────────────────
-.PHONY: db-migrate seed-db
+.PHONY: db-schema db-migrate seed-db
+
+# _psql: run a SQL file against the database.
+# Prefers local psql; falls back to docker exec on rag-production-db-1.
+define _psql
+	@if command -v psql >/dev/null 2>&1; then \
+		PGPASSWORD=$$POSTGRES_PASSWORD psql \
+			-h $${POSTGRES_HOST:-localhost} \
+			-p $${POSTGRES_PORT:-5432} \
+			-U $${POSTGRES_USER:-postgres} \
+			-d $${POSTGRES_DB:-rag_production} \
+			-f $(1); \
+	else \
+		docker exec -i rag-production-db-1 psql \
+			-U $${POSTGRES_USER:-postgres} \
+			-d $${POSTGRES_DB:-rag_production} \
+			< $(1); \
+	fi
+endef
+
+db-schema:
+	@echo "Applying baseline schema (schema.sql) — safe to re-run on a fresh DB..."
+	$(call _psql,schema.sql)
 
 db-migrate:
-	@echo "Running schema migrations..."
-	@bash -c "PGPASSWORD=$$POSTGRES_PASSWORD psql -h $$POSTGRES_HOST -U $$POSTGRES_USER -d $$POSTGRES_DB -f schema.sql"
+	@echo "Applying incremental migrations from migrations/ in order..."
+	@for f in $$(ls migrations/*.sql 2>/dev/null | sort); do \
+		echo "  → $$f"; \
+		if command -v psql >/dev/null 2>&1; then \
+			PGPASSWORD=$$POSTGRES_PASSWORD psql \
+				-h $${POSTGRES_HOST:-localhost} \
+				-p $${POSTGRES_PORT:-5432} \
+				-U $${POSTGRES_USER:-postgres} \
+				-d $${POSTGRES_DB:-rag_production} \
+				-f $$f; \
+		else \
+			docker exec -i rag-production-db-1 psql \
+				-U $${POSTGRES_USER:-postgres} \
+				-d $${POSTGRES_DB:-rag_production} \
+				< $$f; \
+		fi; \
+	done
+	@echo "Migrations done."
 
 seed-db:
 	@echo "Seeding database with test data..."
@@ -135,8 +173,12 @@ help:
 	@echo "  docker-services   Start only infra (db, qdrant, prometheus, grafana)"
 	@echo "  docker-logs       Tail app logs"
 	@echo ""
-	@echo "  db-migrate        Apply schema.sql"
+	@echo "  db-schema         Apply baseline schema.sql (fresh DB only)"
+	@echo "  db-migrate        Apply all migrations/*.sql in order (incremental)"
 	@echo "  seed-db           Seed test data"
+	@echo ""
+	@echo "  New environment setup:"
+	@echo "    make docker-services && make db-schema && make db-migrate && make seed-db"
 	@echo "  ingest-sample     Ingest sample documents"
 	@echo ""
 	@echo "Override ENV: make docker-up ENV=staging"

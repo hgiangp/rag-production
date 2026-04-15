@@ -1,7 +1,7 @@
 """Chat request/response schemas — OpenAI-compatible where possible."""
 
 from datetime import datetime
-from typing import List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -26,6 +26,40 @@ class RetrievedChunk(BaseModel):
     content: str = Field(description="Full chunk content")
     score: Optional[float] = Field(None, ge=0.0, le=1.0, description="Relevance score if available")
     tool: str = Field(description="Tool that retrieved this chunk")
+
+
+class WorkflowStep(BaseModel):
+    """A single observable step in the RAG pipeline, emitted as a streaming event.
+
+    step_type values:
+      query_rewrite     — LLM rewrote and decomposed the user's query
+      tool_retrieval    — a retrieval tool returned chunks
+      cross_ref_detected — cross-reference targets extracted from retrieved text
+      cross_ref_fetched  — cross-reference context fetched from vector store
+      aggregation       — N sub-answers merged into the final answer
+
+    status:
+      running — step has started, not yet complete (shown as live spinner in UI)
+      done    — step completed; data and duration_ms are populated
+
+    data dict shape per step_type (all keys optional for forward compatibility):
+      query_rewrite:      {sub_questions: str[], detected_language: str}
+      tool_retrieval:     {tool_name: str, chunks_found: int, chunks: RetrievedChunk[]}
+      cross_ref_detected: {references: str[], count: int}
+      cross_ref_fetched:  {contexts_injected: int}
+      aggregation:        {sub_answer_count: int}
+    """
+    step_type: Literal[
+        "query_rewrite",
+        "tool_retrieval",
+        "cross_ref_detected",
+        "cross_ref_fetched",
+        "aggregation",
+    ]
+    title: str
+    status: Literal["running", "done"]
+    data: Optional[Dict[str, Any]] = None
+    duration_ms: Optional[int] = None
 
 
 class TriadScores(BaseModel):
@@ -67,13 +101,15 @@ class StreamChunk(BaseModel):
       progress        — pipeline step status (rewrite, retrieve, synthesize)
       retrieved_chunk — chunks returned by a retrieval tool
       citation        — final source citations after generation
+      workflow_step   — structured pipeline step (running or done)
       done            — stream completed
       error           — unrecoverable error
     """
-    type: Literal["token", "progress", "retrieved_chunk", "citation", "done", "error"]
+    type: Literal["token", "progress", "retrieved_chunk", "citation", "workflow_step", "done", "error"]
     content: str = ""
     citations: Optional[List[Citation]] = None
     retrieved_chunks: Optional[List[RetrievedChunk]] = None
+    workflow_step: Optional[WorkflowStep] = None
     error: Optional[str] = None
 
 
@@ -92,6 +128,10 @@ class HistoryMessage(BaseModel):
     content: str
     citations: List[Citation] = Field(default_factory=list)
     eval_scores: Optional[TriadScores] = None
+    workflow_steps: List[WorkflowStep] = Field(
+        default_factory=list,
+        description="Ordered pipeline steps recorded during generation; empty for legacy messages.",
+    )
     created_at: datetime
 
 

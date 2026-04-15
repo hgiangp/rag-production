@@ -74,9 +74,10 @@ CREATE TABLE IF NOT EXISTS chat_message (
     user_id     UUID NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
     role        TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
     content     TEXT NOT NULL,
-    citations   JSONB NOT NULL DEFAULT '[]',
-    eval_scores JSONB,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    citations      JSONB NOT NULL DEFAULT '[]',
+    eval_scores    JSONB,
+    workflow_steps JSONB NOT NULL DEFAULT '[]',
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_chat_message_session_created ON chat_message (session_id, created_at);

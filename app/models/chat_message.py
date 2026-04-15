@@ -24,6 +24,10 @@ class ChatMessage(SQLModel, table=True):
         default=None,
         sa_column=Column(JSON, nullable=True),
     )
+    workflow_steps: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        sa_column=Column(JSON, nullable=False, server_default="[]"),
+    )
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc).replace(tzinfo=None)
     )

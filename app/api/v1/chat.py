@@ -36,6 +36,7 @@ from app.schemas.chat import (
     SessionInfo,
     StreamChunk,
     TriadScores,
+    WorkflowStep,
 )
 from app.services.database import get_db_session
 
@@ -58,6 +59,26 @@ _TOOL_PROGRESS = {
     "resolve_cross_references": "Resolving cross-references...",
 }
 _RETRIEVAL_TOOLS = frozenset(_TOOL_PROGRESS.keys())
+
+# Nodes that emit workflow_step events (subset of _NODE_PROGRESS)
+_WORKFLOW_NODE_PROGRESS = frozenset({"rewrite_query", "aggregate_answers"})
+# Nodes NOT in _NODE_PROGRESS that still get workflow_step events
+_WORKFLOW_CROSS_REF_NODES = frozenset({"detect_cross_references", "fetch_cross_ref_context"})
+# Maps node name → step_type string used in WorkflowStep.step_type
+_WORKFLOW_NODE_STEP_TYPES: dict = {
+    "rewrite_query": "query_rewrite",
+    "aggregate_answers": "aggregation",
+    "detect_cross_references": "cross_ref_detected",
+    "fetch_cross_ref_context": "cross_ref_fetched",
+}
+# Human-readable label while the node is running (status="running")
+_WORKFLOW_NODE_TITLES_RUNNING: dict = {
+    "rewrite_query": "Analyzing and rewriting query",
+    "aggregate_answers": "Synthesizing final answer",
+    "detect_cross_references": "Detecting cross-references",
+    "fetch_cross_ref_context": "Fetching cross-reference context",
+}
+
 _ERROR_PREFIXES = (
     "NO_RELEVANT_CHUNKS",
     "NO_PARENT_DOCUMENTS",
@@ -112,6 +133,12 @@ def _parse_tool_output(name: str, output: str) -> List[RetrievedChunk]:
     if name in ("search_child_chunks", "fetch_parent_chunks"):
         return _parse_langchain_chunks(output, name)
     return _parse_llamaindex_chunks(output, name)
+
+
+def _emit_workflow_step(step: WorkflowStep) -> str:
+    """Serialize a WorkflowStep as an SSE data line."""
+    sse = StreamChunk(type="workflow_step", workflow_step=step)
+    return f"data: {sse.model_dump_json()}\n\n"
 
 
 # ── Session title generation ───────────────────────────────────────────────────
@@ -202,6 +229,7 @@ async def _save_turn(
     citations: List[Citation],
     eval_scores: Optional[TriadScores] = None,
     target_language: str = "en",
+    workflow_steps: Optional[List[dict]] = None,
 ) -> None:
     """Persist one user + assistant turn to chat_message.
 
@@ -232,6 +260,7 @@ async def _save_turn(
         content=answer,
         citations=[c.model_dump() for c in citations],
         eval_scores=scores_dict,
+        workflow_steps=workflow_steps or [],
     )
     db.add(user_msg)
     db.add(asst_msg)
@@ -371,12 +400,19 @@ async def get_session_history(
     for m in messages:
         citations = [Citation(**c) for c in (m.citations or [])]
         scores = TriadScores(**m.eval_scores) if m.eval_scores else None
+        steps: List[WorkflowStep] = []
+        for s in (m.workflow_steps or []):
+            try:
+                steps.append(WorkflowStep.model_validate(s))
+            except Exception:
+                pass
         history.append(HistoryMessage(
             id=m.id,
             role=m.role,
             content=m.content,
             citations=citations,
             eval_scores=scores,
+            workflow_steps=steps,
             created_at=m.created_at,
         ))
 
@@ -514,34 +550,133 @@ async def chat_stream(
             token_emitted = False
             seen_nodes: set = set()
             streamed_tokens: List[str] = []
+            # Per-run timing: keyed by event run_id (unique per node/tool invocation)
+            step_start_times: dict = {}
+            # Filled by rewrite_query, read by aggregate_answers to count sub-answers
+            collected_sub_questions: List[str] = []
+            # Completed workflow steps to persist to DB
+            workflow_steps_log: List[dict] = []
 
             async for event in graph.astream_events(initial_state, config=config, version="v2"):
                 ev = event["event"]
                 name = event.get("name", "")
+                run_id = event.get("run_id") or name
                 metadata = event.get("metadata", {})
                 is_node_event = name == metadata.get("langgraph_node", "")
 
+                # ── on_chain_start for nodes in _NODE_PROGRESS ─────────────────
                 if ev == "on_chain_start" and is_node_event and name in _NODE_PROGRESS:
                     if name not in seen_nodes:
                         seen_nodes.add(name)
                         sse = StreamChunk(type="progress", content=_NODE_PROGRESS[name])
                         yield f"data: {sse.model_dump_json()}\n\n"
+                    if name in _WORKFLOW_NODE_PROGRESS:
+                        step_start_times[run_id] = int(time.time() * 1000)
+                        yield _emit_workflow_step(WorkflowStep(
+                            step_type=_WORKFLOW_NODE_STEP_TYPES[name],
+                            title=_WORKFLOW_NODE_TITLES_RUNNING[name],
+                            status="running",
+                        ))
 
+                # ── on_chain_end for rewrite_query ─────────────────────────────
                 elif ev == "on_chain_end" and is_node_event and name == "rewrite_query":
                     output = event.get("data", {}).get("output", {})
                     questions = output.get("rewritten_questions", []) if isinstance(output, dict) else []
+                    lang = output.get("query_language", "en") if isinstance(output, dict) else "en"
                     if questions:
                         sse = StreamChunk(type="progress", content=f"Sub-questions: {' | '.join(questions)}")
                         yield f"data: {sse.model_dump_json()}\n\n"
+                    collected_sub_questions = questions
+                    duration = int(time.time() * 1000) - step_start_times.pop(run_id, int(time.time() * 1000))
+                    step = WorkflowStep(
+                        step_type="query_rewrite",
+                        title=f"Query rewritten — {len(questions)} sub-question(s)",
+                        status="done",
+                        data={"sub_questions": questions, "detected_language": lang},
+                        duration_ms=duration,
+                    )
+                    workflow_steps_log.append(step.model_dump())
+                    yield _emit_workflow_step(step)
 
+                # ── on_chain_start for cross-ref nodes (not in _NODE_PROGRESS) ──
+                elif ev == "on_chain_start" and is_node_event and name in _WORKFLOW_CROSS_REF_NODES:
+                    step_start_times[run_id] = int(time.time() * 1000)
+                    yield _emit_workflow_step(WorkflowStep(
+                        step_type=_WORKFLOW_NODE_STEP_TYPES[name],
+                        title=_WORKFLOW_NODE_TITLES_RUNNING[name],
+                        status="running",
+                    ))
+
+                # ── on_chain_end for detect_cross_references ───────────────────
+                elif ev == "on_chain_end" and is_node_event and name == "detect_cross_references":
+                    output = event.get("data", {}).get("output", {})
+                    targets = output.get("cross_ref_targets", []) if isinstance(output, dict) else []
+                    labels: List[str] = []
+                    for t in (targets or []):
+                        if isinstance(t, str):
+                            labels.append(t)
+                        elif isinstance(t, dict):
+                            spec = t.get("spec_name") or t.get("spec_id") or "?"
+                            section = t.get("section_number") or t.get("section") or ""
+                            labels.append(f"{spec} § {section}" if section else spec)
+                    duration = int(time.time() * 1000) - step_start_times.pop(run_id, int(time.time() * 1000))
+                    step = WorkflowStep(
+                        step_type="cross_ref_detected",
+                        title=f"Found {len(labels)} cross-reference(s)",
+                        status="done",
+                        data={"references": labels, "count": len(labels)},
+                        duration_ms=duration,
+                    )
+                    workflow_steps_log.append(step.model_dump())
+                    yield _emit_workflow_step(step)
+
+                # ── on_chain_end for fetch_cross_ref_context ───────────────────
+                elif ev == "on_chain_end" and is_node_event and name == "fetch_cross_ref_context":
+                    output = event.get("data", {}).get("output", {})
+                    injected = 1 if (isinstance(output, dict) and output.get("messages")) else 0
+                    duration = int(time.time() * 1000) - step_start_times.pop(run_id, int(time.time() * 1000))
+                    step = WorkflowStep(
+                        step_type="cross_ref_fetched",
+                        title="Cross-reference context fetched",
+                        status="done",
+                        data={"contexts_injected": injected},
+                        duration_ms=duration,
+                    )
+                    workflow_steps_log.append(step.model_dump())
+                    yield _emit_workflow_step(step)
+
+                # ── on_chain_end for aggregate_answers ─────────────────────────
+                elif ev == "on_chain_end" and is_node_event and name == "aggregate_answers":
+                    n = len(collected_sub_questions) or 1
+                    duration = int(time.time() * 1000) - step_start_times.pop(run_id, int(time.time() * 1000))
+                    step = WorkflowStep(
+                        step_type="aggregation",
+                        title=f"Synthesized {n} sub-answer(s)",
+                        status="done",
+                        data={"sub_answer_count": n},
+                        duration_ms=duration,
+                    )
+                    workflow_steps_log.append(step.model_dump())
+                    yield _emit_workflow_step(step)
+
+                # ── on_tool_start ──────────────────────────────────────────────
                 elif ev == "on_tool_start" and name in _TOOL_PROGRESS:
                     sse = StreamChunk(type="progress", content=_TOOL_PROGRESS[name])
                     yield f"data: {sse.model_dump_json()}\n\n"
+                    if name in _RETRIEVAL_TOOLS:
+                        step_start_times[run_id] = int(time.time() * 1000)
+                        yield _emit_workflow_step(WorkflowStep(
+                            step_type="tool_retrieval",
+                            title=_TOOL_PROGRESS[name].rstrip("."),
+                            status="running",
+                        ))
 
+                # ── on_tool_end ────────────────────────────────────────────────
                 elif ev == "on_tool_end" and name in _RETRIEVAL_TOOLS:
                     raw = event.get("data", {}).get("output", "")
                     if hasattr(raw, "content"):
                         raw = raw.content
+                    duration = int(time.time() * 1000) - step_start_times.pop(run_id, int(time.time() * 1000))
                     if isinstance(raw, str) and not raw.startswith(_ERROR_PREFIXES):
                         parsed = _parse_tool_output(name, raw)
                         if parsed:
@@ -551,7 +686,37 @@ async def chat_stream(
                                 retrieved_chunks=parsed,
                             )
                             yield f"data: {sse.model_dump_json()}\n\n"
+                            step = WorkflowStep(
+                                step_type="tool_retrieval",
+                                title=f"Retrieved {len(parsed)} chunk(s) via {name}",
+                                status="done",
+                                data={
+                                    "tool_name": name,
+                                    "chunks_found": len(parsed),
+                                    "chunks": [c.model_dump() for c in parsed],
+                                },
+                                duration_ms=duration,
+                            )
+                        else:
+                            step = WorkflowStep(
+                                step_type="tool_retrieval",
+                                title=f"No results via {name}",
+                                status="done",
+                                data={"tool_name": name, "chunks_found": 0, "chunks": []},
+                                duration_ms=duration,
+                            )
+                    else:
+                        step = WorkflowStep(
+                            step_type="tool_retrieval",
+                            title=f"No results via {name}",
+                            status="done",
+                            data={"tool_name": name, "chunks_found": 0, "chunks": []},
+                            duration_ms=duration,
+                        )
+                    workflow_steps_log.append(step.model_dump())
+                    yield _emit_workflow_step(step)
 
+                # ── LLM token stream ───────────────────────────────────────────
                 elif ev == "on_chat_model_stream":
                     chunk = event["data"]["chunk"]
                     if hasattr(chunk, "content") and chunk.content:
@@ -592,6 +757,7 @@ async def chat_stream(
                         answer=final_answer,
                         citations=citations,
                         target_language=body.target_language or settings.DEFAULT_TARGET_LANGUAGE,
+                        workflow_steps=workflow_steps_log,
                     )
 
             yield f"data: {StreamChunk(type='done').model_dump_json()}\n\n"
